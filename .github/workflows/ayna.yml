@@ -1,0 +1,290 @@
+name: Yaptırım aynası
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      gerileme_denetimini_atla:
+        description: >-
+          Gerileme denetimini atla (Publish_Date geriye gitmesi, aynı tarihte %10'dan fazla
+          düşüş). Yalnız elle doğrulanmış bir OFAC düzeltmesi ya da hatalı bir önceki sürüm için.
+        type: boolean
+        default: false
+
+# İzinler iş başına verilir; jetonu (GH_TOKEN) yalnız gh çağıran adımlar görür.
+permissions: {}
+
+concurrency:
+  group: yaptirim-aynasi
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ayna:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      SAKLANACAK_SURUM: "30"
+    steps:
+      - name: Depoyu al
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Birim testleri
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Önceki manifesti indir
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p onceki
+          if gh api "repos/$GH_REPO/releases/latest" > son.json 2> onceki-hata.txt; then
+            etiket=$(jq -r .tag_name son.json)
+            if [[ ! "$etiket" =~ ^ayna-[0-9]{12}$ ]]; then
+              echo "::warning::latest sürüm ($etiket) bir ayna sürümü değil; ilk yayın gibi davranılıyor, yeni ayna sürümü latest yapılacak."
+            elif ! jq -e 'any(.assets[]; .name == "manifest.json")' son.json > /dev/null; then
+              echo "::warning::latest sürümde ($etiket) manifest.json yok; ilk yayın gibi davranılıyor, yeni ayna sürümü latest yapılacak."
+            else
+              echo "Önceki sürüm: $etiket"
+              gh release download "$etiket" --pattern manifest.json --dir onceki
+            fi
+          elif grep -q "HTTP 404" onceki-hata.txt; then
+            echo "Önceki sürüm yok; ilk yayın yapılacak."
+          else
+            cat onceki-hata.txt >&2
+            echo "::error::Önceki sürüm okunamadı"
+            exit 1
+          fi
+
+      - name: Listeleri indir ve doğrula
+        id: ayna
+        env:
+          GERILEME_DENETIMINI_ATLA: ${{ inputs.gerileme_denetimini_atla }}
+        run: |
+          arg=(--cikti cikti --notlar notlar.md)
+          if [[ -f onceki/manifest.json ]]; then
+            arg+=(--onceki onceki/manifest.json)
+          fi
+          if [[ "$GERILEME_DENETIMINI_ATLA" == "true" ]]; then
+            arg+=(--gerileme-denetimini-atla)
+          fi
+          python3 scripts/ayna.py "${arg[@]}"
+
+      - name: Nabzı yayımla
+        id: nabiz
+        # Resmî özetler değişmedi: yalnız son_kontrol_at'i yenilenmiş manifest.json son sürüme
+        # yüklenir. Legaluga aynanın tazeliğini bu alandan ölçer (en çok 48 saat).
+        if: steps.ayna.outputs.nabiz == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIKET: ${{ steps.ayna.outputs.etiket }}
+        run: |
+          [[ "$ETIKET" =~ ^ayna-[0-9]{12}$ ]] || { echo "::error::Geçersiz etiket: $ETIKET"; exit 1; }
+          # --clobber eskisini silip yenisini yükler; arada birkaç saniye manifest.json bulunmaz ve
+          # Legaluga o an resmî kaynağa düşer. Veri dosyalarına dokunulmaz.
+          gh release upload "$ETIKET" cikti/manifest.json --clobber
+          yerel=$(sha256sum cikti/manifest.json | cut -d' ' -f1)
+          for deneme in 1 2 3 4 5 6; do
+            uzak=$(gh api "repos/$GH_REPO/releases/tags/$ETIKET" \
+              --jq '.assets[] | select(.name == "manifest.json") | .digest // empty' || true)
+            if [[ "$uzak" == "sha256:$yerel" ]]; then
+              echo "Nabız yayımlandı: $ETIKET"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Nabız manifesti yüklendi ama özeti doğrulanamadı ($ETIKET)"
+          exit 1
+
+      - name: Sürümü yayımla
+        id: yayimla
+        if: steps.ayna.outputs.degisti == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIKET: ${{ steps.ayna.outputs.etiket }}
+        run: |
+          [[ "$ETIKET" =~ ^ayna-[0-9]{12}$ ]] || { echo "::error::Geçersiz etiket: $ETIKET"; exit 1; }
+          # Geri alma adımı yalnız bu çalıştırmanın oluşturduğu sürümü silsin: etiket zaten varsa
+          # (ya da varlığı denetlenemiyorsa) sürüm oluşturulmaz.
+          if gh api "repos/$GH_REPO/git/ref/tags/$ETIKET" > /dev/null 2> etiket-hata.txt; then
+            echo "::error::$ETIKET etiketi zaten var"
+            exit 1
+          elif ! grep -q "HTTP 404" etiket-hata.txt; then
+            cat etiket-hata.txt >&2
+            echo "::error::$ETIKET etiketinin varlığı denetlenemedi"
+            exit 1
+          fi
+          echo "baslatildi=true" >> "$GITHUB_OUTPUT"
+          gh release create "$ETIKET" \
+            cikti/sdn.xml cikti/consolidated.xml cikti/manifest.json \
+            --latest \
+            --title "OFAC aynası $ETIKET" \
+            --notes-file notlar.md
+
+      - name: Yayını doğrula
+        id: dogrula
+        if: steps.ayna.outputs.degisti == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIKET: ${{ steps.ayna.outputs.etiket }}
+        run: |
+          # GitHub API'si yayımdan hemen sonra eski değer döndürebilir; okumalar birkaç kez denenir.
+          for deneme in 1 2 3 4 5 6; do
+            if gh api "repos/$GH_REPO/releases/tags/$ETIKET" > yayin.json \
+              && [[ "$(jq -r .draft yayin.json)" == "false" ]] \
+              && [[ "$(jq '.assets | length' yayin.json)" == "3" ]]; then
+              break
+            fi
+            if (( deneme == 6 )); then
+              echo "::error::Sürüm okunamadı, taslak kaldı ya da 3 dosyası yok"
+              exit 1
+            fi
+            sleep 5
+          done
+          for ad in sdn.xml consolidated.xml manifest.json; do
+            uzak_boyut=$(jq -r --arg ad "$ad" '.assets[] | select(.name == $ad) | .size' yayin.json)
+            yerel_boyut=$(stat -c %s "cikti/$ad")
+            [[ "$uzak_boyut" == "$yerel_boyut" ]] || { echo "::error::$ad boyutu uyuşmuyor ($uzak_boyut != $yerel_boyut)"; exit 1; }
+            uzak_ozet=$(jq -r --arg ad "$ad" '.assets[] | select(.name == $ad) | .digest // empty' yayin.json)
+            yerel_ozet="sha256:$(sha256sum "cikti/$ad" | cut -d' ' -f1)"
+            if [[ -n "$uzak_ozet" && "$uzak_ozet" != "$yerel_ozet" ]]; then
+              echo "::error::$ad özeti uyuşmuyor ($uzak_ozet != $yerel_ozet)"
+              exit 1
+            fi
+          done
+          son=""
+          for deneme in 1 2 3 4 5 6; do
+            son=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name) && [[ "$son" == "$ETIKET" ]] && break
+            if (( deneme == 6 )); then
+              echo "::error::latest sürüm ${son:-okunamadı}, beklenen $ETIKET"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Yayın doğrulandı: $ETIKET"
+
+      - name: Başarısız yayını geri al
+        # Yalnız bu çalıştırmanın oluşturmaya başladığı sürüm ve yalnız yayımlama ya da doğrulama
+        # başarısızsa; budama hatası yeni sürümü silmez.
+        if: >-
+          failure() && steps.yayimla.outputs.baslatildi == 'true'
+          && (steps.yayimla.outcome == 'failure' || steps.dogrula.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIKET: ${{ steps.ayna.outputs.etiket }}
+        run: |
+          [[ "$ETIKET" =~ ^ayna-[0-9]{12}$ ]] || { echo "::error::Geçersiz etiket: $ETIKET"; exit 1; }
+          if gh release view "$ETIKET" --json tagName > /dev/null 2>&1; then
+            gh release delete "$ETIKET" --yes
+            echo "::error::Yayın doğrulanamadı; $ETIKET sürümü silindi. Önceki sürüm latest olarak kalır, sonraki çalıştırma yeniden yayımlar."
+          else
+            echo "Silinecek sürüm yok: $ETIKET"
+          fi
+          if gh api "repos/$GH_REPO/git/ref/tags/$ETIKET" > /dev/null 2>&1; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$ETIKET" > /dev/null \
+              || echo "::warning::$ETIKET etiketi silinemedi (değişmez sürümler açık olabilir)."
+          fi
+
+      - name: Eski sürümleri buda
+        env:
+          GH_TOKEN: ${{ github.token }}
+          YENI: ${{ steps.ayna.outputs.degisti == 'true' && steps.ayna.outputs.etiket || '' }}
+        run: |
+          if ! gh api "repos/$GH_REPO/releases/latest" --jq .tag_name > son.txt 2> son-hata.txt; then
+            if grep -q "HTTP 404" son-hata.txt; then
+              echo "Henüz sürüm yok; budama atlandı."
+              exit 0
+            fi
+            cat son-hata.txt >&2
+            echo "::error::latest sürüm okunamadı; budama yapılamadı."
+            exit 1
+          fi
+          son=$(< son.txt)
+          # Yalnız ayna-YYYYMMDDHHMM etiketli yayımlanmış sürümler; etiket adı zaman damgası
+          # olduğundan ters sözlük sırası en yeniden en eskiye sıralar. Elle açılan sürümlere dokunulmaz.
+          # Liste önce dosyaya yazılır: süreç ikamesindeki (< <(...)) bir gh hatası pipefail'e
+          # takılmaz ve budama sessizce atlanırdı.
+          if ! gh api "repos/$GH_REPO/releases?per_page=100" --paginate \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^ayna-[0-9]{12}$"))' \
+            > etiketler.txt; then
+            echo "::error::Sürüm listesi okunamadı; budama yapılamadı."
+            exit 1
+          fi
+          sort -r etiketler.txt > sirali.txt
+          etiketler=()
+          while IFS= read -r etiket; do
+            if [[ -n "$etiket" ]]; then etiketler+=("$etiket"); fi
+          done < sirali.txt
+          echo "ayna sürümü: ${#etiketler[@]}, saklanacak: $SAKLANACAK_SURUM, latest: $son"
+          if (( ${#etiketler[@]} <= SAKLANACAK_SURUM )); then
+            exit 0
+          fi
+          for etiket in "${etiketler[@]:SAKLANACAK_SURUM}"; do
+            if [[ "$etiket" == "$son" || "$etiket" == "$YENI" ]]; then
+              echo "Atlandı (latest/yeni): $etiket"
+              continue
+            fi
+            echo "Siliniyor: $etiket"
+            gh release delete "$etiket" --yes
+            # Etiket ayrı silinir: değişmez sürümler açıksa etiket silinemez, bu iş kırmızıya düşmez.
+            if ! gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$etiket" > /dev/null; then
+              echo "::warning::$etiket etiketi silinemedi (değişmez sürümler açık olabilir); sürüm silindi, etiket kaldı."
+            fi
+          done
+
+      - name: Özet
+        if: always()
+        env:
+          DEGISTI: ${{ steps.ayna.outputs.degisti }}
+          ETIKET: ${{ steps.ayna.outputs.etiket }}
+          DOGRULAMA: ${{ steps.dogrula.outcome }}
+        run: |
+          {
+            echo "## Yaptırım aynası"
+            echo
+            case "$DEGISTI" in
+              true)
+                if [[ "$DOGRULAMA" == "success" ]]; then
+                  echo "Yeni sürüm: \`$ETIKET\`"
+                else
+                  echo "Yeni sürüm \`$ETIKET\` yayımlanamadı ya da doğrulanamadı; geri alma adımına bakın."
+                fi
+                ;;
+              false) echo "Değişiklik yok (OFAC resmî özetleri aynı); son sürümün manifest.json'u nabızla yenilendi: \`$ETIKET\`" ;;
+              *) echo "Çalıştırma tamamlanmadı; adım günlüklerine bakın." ;;
+            esac
+            echo
+            if [[ -f notlar.md ]]; then cat notlar.md; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  canli-tut:
+    # GitHub, herkese açık depolarda 60 gün depo etkinliği olmazsa zamanlanmış iş akışlarını
+    # devre dışı bırakır. İş akışını "etkinleştir" API'siyle yeniden etkinleştirmek bu sayacı
+    # sıfırlar (keepalive-workflow'un API kipinin yöntemi); boş commit gerekmez. Bu iş ayna
+    # işinden bağımsızdır: ayna art arda başarısız olsa da zamanlama kapanmaz.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Zamanlamayı etkin tut
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          is_akisi=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+          gh api -X PUT "repos/$GH_REPO/actions/workflows/$is_akisi/enable"
+          echo "İş akışı etkin tutuldu: $is_akisi"

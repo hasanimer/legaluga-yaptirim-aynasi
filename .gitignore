@@ -1,0 +1,17 @@
+# Çalıştırma çıktıları (veri yalnızca Release'lerde tutulur)
+cikti/
+onceki/
+notlar.md
+yayin.json
+onceki-hata.txt
+son.json
+son.txt
+son-hata.txt
+etiket-hata.txt
+etiketler.txt
+sirali.txt
+*.part
+*.tmp
+
+__pycache__/
+*.pyc
