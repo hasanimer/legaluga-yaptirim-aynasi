@@ -11,8 +11,10 @@ GitHub Releases üzerinde tutulan, bayt bayt aynası.
 
 ## Ne yapar
 
-GitHub Actions, OFAC Sanctions List Service'teki iki dosyayı her gün 3 saatte bir, hafta içi
-OFAC'ın yayın saatlerinde (12:17–21:17 UTC) saatte bir denetler ([neden bu sıklık](#neden-bu-sıklık)):
+GitHub Actions, OFAC Sanctions List Service'teki iki dosyayı planlı olarak her gün 3 saatte bir,
+hafta içi OFAC'ın olağan yayın saatlerini kapsayan 12:17–21:17 UTC aralığında saatte bir denetler
+(GitHub'ın gecikmeleri yüzünden pratikte daha seyrek;
+[neden bu sıklık](#neden-bu-sıklık)):
 
 | Anahtar | Dosya | Resmî kaynak |
 |---|---|---|
@@ -174,18 +176,20 @@ aynı olmalıdır.
 
 ### Neden bu sıklık
 
-Sıklık iki ayrı ihtiyaçtan çıkar; `ayna.yml`'deki iki cron satırının her biri yalnız birine
-hizmet eder. Saatler UTC'dir.
+Sıklık iki ayrı ihtiyaçtan çıkar: aynanın canlı olduğunu göstermek ve OFAC'ın yayınlarını
+çabuk yakalamak. `ayna.yml`'deki iki cron satırı bunları karşılar. Saatler UTC'dir.
 
 - **Taban, `17 */3 * * *`: her gün 3 saatte bir.** Legaluga `son_kontrol_at` 48 saatten eskiyse
-  aynayı kullanmaz. Taban planlı iki kontrol arasını 3 saatle sınırlar; sınırın aşılması için art
-  arda 16 planlı çalıştırmanın kaybolması gerekir. OFAC'ın ne zaman yayımladığına dair bir
-  varsayıma dayanmaz: pencere satırı değiştirilse ya da silinse de bu güvence kalır. Akşam ya da
-  hafta sonu yapılan seyrek yayınlar da bu satırla yakalanır.
-- **OFAC penceresi, `17 13,14,16,17,19,20 * * 1-5`: hafta içi 12:17–21:17 arasında saatte bir.**
-  OFAC'ın önceden belirlenmiş bir yayın takvimi yoktur, ancak SDN güncellemeleri pratikte ABD iş
-  günlerinde, ABD Doğu saatiyle (ET) 09:00–16:00 arasında, çoğunlukla saat başını birkaç dakika
-  geçe (en sık 10:00) yayımlanır. Bu satır tabanın o saatlerdeki boşluklarını doldurur.
+  aynayı kullanmaz. Taban planlı iki kontrol arasını 3 saatle sınırlar; 48 saat sınırı ancak
+  yaklaşık iki gün boyunca hiçbir çalıştırma başarılı olmazsa aşılır. Taban OFAC'ın ne zaman
+  yayımladığına dair bir varsayıma dayanmaz; pencere satırı değiştirilse ya da silinse de bu
+  güvence kalır. Akşam ya da hafta sonu yapılan seyrek yayınlar da bu satırla yakalanır.
+- **OFAC penceresi, `17 13,14,16,17,19,20 * * 1-5`: hafta içi tabanla birlikte 12:17–21:17
+  arasında saatte bir.** OFAC'ın önceden belirlenmiş bir yayın takvimi yoktur, ancak SDN
+  güncellemeleri pratikte ABD iş günlerinde, ABD Doğu saatiyle (ET) 09:00–16:00 arasında (en sık
+  10:00 civarında, genellikle saat başını birkaç dakika geçe) yayımlanır. Bu satır tabanın o
+  saatlerdeki boşluklarını doldurur; saatlik aralığın 12:17, 15:17, 18:17 ve 21:17 kontrolleri
+  tabandan gelir.
 
   | Hafta içi pencere | UTC | ET | Türkiye |
   |---|---|---|---|
@@ -193,19 +197,22 @@ hizmet eder. Saatler UTC'dir.
   | ABD kış saati (Kasım–Mart) | 12:17–21:17 | 07:17–16:17 | 15:17–00:17 |
 
   İki durumda da 09:00–16:00 ET kapsandığı için ABD'deki saat değişiminde cron'a dokunulmaz.
-  Pencere satırının saatleri tabanınkilerle (0, 3, 6 … 21) çakışmamalıdır.
+  Pencere satırının saatleri tabanınkilerle (0, 3, 6 … 21) çakışmamalıdır; taban değişirse pencere
+  saatleri de buna göre güncellenmelidir.
 - Dakika 17, GitHub'ın yoğun olduğu saat başından uzak durmak içindir. Planlı çalıştırma sayısı
-  hafta içi günde 14, hafta sonu günde 8'dir (haftada 86). Değişiklik yoksa bir çalıştırma
-  yaklaşık 15 saniye sürer ve OFAC'a yalnız iki küçük özet isteği gider. ABD resmî tatillerinde de
-  pencere çalışır; birkaç boş kontrol için tatil takvimi tutmaya değmez.
+  hafta içi günde 14, hafta sonu günde 8'dir (haftada 86; eskiden 56). Değişiklik yoksa bir
+  çalıştırma yaklaşık 15 saniye sürer ve OFAC'a yalnız iki küçük özet isteği gider; nabız da
+  `manifest.json`'u birkaç saniyeliğine kaldırıp yeniden yükler. ABD resmî tatillerinde de pencere
+  çalışır; birkaç boş kontrol için tatil takvimi tutmaya değmez.
 
-**Cron bir istektir, söz değil.** Planlı gecikme pencerede en çok 1 saat, pencere dışında en çok
-3 saattir; gerçek gecikmeyi GitHub belirler. Ekim 2026'da 3 saatlik cron'un planlı
-çalıştırmalarının yalnız %40 kadarı gerçekleşti; çalıştırmalar arası ortalama 7,8, en çok 10,4
-saat oldu. Böyle dönemlerde cron'u sıklaştırmak gerçek çalıştırma sayısını orantılı artırmaz
-(pencerenin 15 dakikalık değil saatlik olmasının nedeni budur); tazeliğin güvencesi 48 saat
-kuralıdır. Bir yayının belirli bir süre içinde (ör. 1 saatte) aynaya geçmesi gerekirse iş akışı
-dışarıdaki bir zamanlayıcıdan `workflow_dispatch` ile tetiklenmeli, cron yedek olarak kalmalıdır.
+**Cron bir istektir, söz değil.** Bir OFAC yayınının aynaya yansıması plana göre pencerede en çok
+1 saat, pencere dışında en çok 3 saat sürer; gerçek süreyi GitHub belirler. Ekim 2026'da 3
+saatlik cron'un planlı çalıştırmalarının yalnız %40 kadarı gerçekleşti; çalıştırmalar arası
+ortalama 7,8, en çok 10,4 saat oldu. Böyle dönemlerde cron'u sıklaştırmak gerçek çalıştırma
+sayısını orantılı artırmaz (pencerede kontrolün 15 dakikada bir değil saatte bir yapılmasının
+nedeni budur); tazeliğin güvencesi 48 saat kuralıdır. Bir yayının belirli bir süre içinde (ör. 1
+saatte) aynaya geçmesi gerekirse iş akışı dışarıdaki bir zamanlayıcıdan `workflow_dispatch` ile
+tetiklenmeli, cron yedek olarak kalmalıdır.
 
 ## Legaluga nasıl kullanır
 
@@ -259,14 +266,15 @@ python3 scripts/ayna.py --degisti-mi --yeni cikti/manifest.json --onceki onceki/
 A byte-for-byte mirror of the U.S. Treasury OFAC **SDN** (`sdn.xml`) and **Non-SDN Consolidated**
 (`consolidated.xml`) sanctions lists, published as GitHub Releases.
 
-- Every 3 hours every day (cron `17 */3 * * *`), plus hourly on weekdays from 12:17 to 21:17 UTC
-  (cron `17 13,14,16,17,19,20 * * 1-5`), a GitHub Actions workflow downloads both files from the
-  official OFAC Sanctions List Service, validates them (https-only download and redirects to an
+- Scheduled every 3 hours every day (cron `17 */3 * * *`), plus hourly on weekdays from 12:17 to
+  21:17 UTC (cron `17 13,14,16,17,19,20 * * 1-5`), a GitHub Actions workflow checks both files
+  against OFAC's official digests and, only if they changed, downloads them from the official
+  OFAC Sanctions List Service, validates them (https-only download and redirects to an
   allow-listed host, at most 40 MiB, well-formed XML, root `sdnList`, a valid MM/DD/YYYY
   `Publish_Date` no more than 2 days in the future, `Record_Count` equal to the number of
   `sdnEntry` elements, record bounds of at least 5000 for SDN and 50 to 4999 for consolidated,
-  the two files must differ, no regression against the previous release) and, only if a file
-  changed, publishes a release tagged `ayna-YYYYMMDDHHMM` (UTC) marked as latest. A release that
+  the two files must differ, no regression against the previous release) and publishes a release
+  tagged `ayna-YYYYMMDDHHMM` (UTC) marked as latest. A release that
   fails the post-publish check is deleted. The newest 30 releases are kept.
 - The regression check can be skipped once from **Run workflow** (`gerileme_denetimini_atla`)
   after a genuine OFAC correction has been verified by hand.
@@ -281,14 +289,15 @@ A byte-for-byte mirror of the U.S. Treasury OFAC **SDN** (`sdn.xml`) and **Non-S
   official SHA-256 it was verified against), size, `Publish_Date` and `Record_Count` of each file.
 - Legaluga reads `releases/latest/download/manifest.json`, then fetches each file by the tag in
   the manifest (never via `latest`) and checks size and SHA-256.
-- Schedule rationale: the 3-hourly floor alone keeps `son_kontrol_at` within the 48-hour rule and
-  assumes nothing about OFAC; the weekday line adds hourly checks during OFAC's usual publication
-  hours (09:00–16:00 US Eastern in both EDT and EST). Scheduled runs are best-effort and GitHub
-  often starts them hours late; if a bounded detection time is needed, trigger the workflow via
-  `workflow_dispatch` from an external clock and keep the cron as a fallback.
+- Schedule rationale: the 3-hourly floor keeps the scheduled gap between checks at 3 hours and
+  assumes nothing about OFAC, so `son_kontrol_at` passes 48 hours only if no run succeeds for about
+  two days; the weekday line, together with the floor, makes checks hourly during OFAC's usual
+  publication hours (09:00–16:00 US Eastern in both EDT and EST). Scheduled runs are best-effort
+  and GitHub often starts them hours late; if a bounded detection time is needed, trigger the
+  workflow via `workflow_dispatch` from an external clock and keep the cron as a fallback.
 - Freshness: `son_kontrol_at` is refreshed on every successful run (scheduled at most 3 hours
-  apart, in practice less often); Legaluga stops using the mirror when it is older than 48 hours. `olusturuldu_at` / `indirildi_at` record the
-  run in which a list last changed.
+  apart, in practice less often); Legaluga stops using the mirror when it is older than 48 hours.
+  `olusturuldu_at` / `indirildi_at` record the run in which a list last changed.
 - **This is not an official OFAC source** and is not affiliated with OFAC or the U.S. Department
   of the Treasury. It may be delayed or unavailable. Verify with OFAC for any compliance decision.
 - Data: U.S. Government work, public domain in the U.S. under 17 U.S.C. § 105. Scripts and docs:
