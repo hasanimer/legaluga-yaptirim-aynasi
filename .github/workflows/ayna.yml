@@ -1,8 +1,15 @@
 name: Yaptırım aynası
 
 on:
+  # Saatler UTC; gerekçe README'de ("Neden bu sıklık").
   schedule:
-    - cron: "17 */3 * * *"
+    # Taban: her gün 6 saatte bir. Planlı aralığı 6 saatle sınırlar; 48 saatlik tazelik kuralı
+    # yalnız buna dayanır, OFAC'ın yayın saatlerine dair bir varsayıma dayanmaz.
+    - cron: "17 */6 * * *"
+    # OFAC penceresi: hafta içi tabanın 12:17–21:17 arasındaki boşluklarını doldurur, tabanla
+    # birlikte saatte bir; ABD yaz ve kış saatinde 09:00–16:00 ET'yi kapsar. Saatleri
+    # tabanınkilerle çakışmamalı; taban değişirse bu satır da güncellenmeli.
+    - cron: "17 13-17,19-21 * * 1-5"
   workflow_dispatch:
     inputs:
       gerileme_denetimini_atla:
