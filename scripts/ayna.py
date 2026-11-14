@@ -5,6 +5,11 @@ OFAC SDN ve Non-SDN Consolidated listelerini resmî OFAC Sanctions List Service
 adresinden indirir, bayt bayt saklar, doğrular ve GitHub Release'e konacak
 dosyaları (sdn.xml, consolidated.xml, manifest.json) hazırlar.
 
+Değişiklik verisi (isteğe bağlı, --degisiklikler-kapali ile kapanır): OFAC'ın resmî değişiklik
+akışından (changes/history ve changes/{id}, DeltaFile/1.0 XML) son yayınların delta dosyalarını
+ve önceki sürümün XML'lerine göre uid bazlı liste farkını degisiklikler.json'a yazar. Bu verinin
+alınamaması aynayı durdurmaz: uyarı verilir, sürüm değişiklik verisi olmadan yayımlanır.
+
 Yalnızca Python 3 standart kütüphanesi kullanır.
 
 Çıkış kodları:
@@ -16,8 +21,10 @@ Yalnızca Python 3 standart kütüphanesi kullanır.
 
 Kullanım:
   python3 scripts/ayna.py --cikti cikti [--onceki onceki/manifest.json] [--notlar notlar.md]
+                          [--onceki-dizin onceki] [--degisiklikler-kapali]
                           [--gerileme-denetimini-atla]
   python3 scripts/ayna.py --degisti-mi --yeni cikti/manifest.json [--onceki onceki/manifest.json]
+  python3 scripts/ayna.py --yayin-dosyalari cikti
 """
 
 from __future__ import annotations
@@ -117,6 +124,67 @@ GIRDI_ANAHTARLARI = (
 # son_kontrol_at: aynanın OFAC'ın resmî özetlerini en son karşılaştırdığı an (nabız). Dosyalar
 # değişmese de her çalıştırmada yenilenir; Legaluga aynanın tazeliğini bununla ölçer.
 MANIFEST_ANAHTARLARI = ("surum", "etiket", "olusturuldu_at", "son_kontrol_at", "dosyalar")
+# İsteğe bağlı üst düzey alanlar. Eski manifestlerde yoktur; yeni alan eklemek surum'u
+# değiştirmez (Legaluga'nın okuyucusu bilinmeyen alanları yok sayar). Bu betiğin eski sürümü
+# bu alanı taşıyan manifesti reddeder; geri dönüş yolu README'de ("Değişiklik verisi").
+MANIFEST_ISTEGE_BAGLI = ("degisiklikler",)
+
+# --------------------------------------------------------------------------- değişiklik verisi
+# OFAC'ın resmî değişiklik akışı. Geçmiş: yıl başına JSON dizi [{publicationID, datePublished}].
+# Delta: /changes/{id} imzalı GovCloud S3 adresine 302 verir; DeltaFile/1.0 XML'inde her
+# entity'nin action özniteliği "add" ya da "remove"dur, özniteliği olmayan entity'nin alt
+# öğeleri değişmiştir. Entity id'si SDN XML'indeki sdnEntry/uid ile aynıdır.
+DEGISIKLIK_GECMIS_KOKU = "https://sanctionslistservice.ofac.treas.gov/changes/history/"
+DEGISIKLIK_DELTA_KOKU = "https://sanctionslistservice.ofac.treas.gov/changes/"
+DELTA_AD_ALANI = "https://www.treasury.gov/ofac/DeltaFile/1.0"
+DEGISIKLIK_YAYIN_SAYISI = 30  # Release'e konan en yeni yayın sayısı (≈ 2 ay)
+GECMIS_AZAMI_BAYT = 1024 * 1024
+DELTA_TOPLAM_AZAMI_BAYT = 200 * 1024 * 1024
+DEGISIKLIK_OZETI_AD = "degisiklikler.json"
+DEGISIKLIK_OZETI_AZAMI_BAYT = 8 * 1024 * 1024
+DEGISIKLIK_OZETI_SURUM = 1
+DELTA_AD_RE = re.compile(r"ofac-delta-[1-9][0-9]{0,9}\.xml")
+YAYIN_ZAMANI_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?"
+)
+# Delta XML'indeki datePublished: "2026-11-13T00:00:00-05:00".
+DELTA_TARIHI_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?(?:Z|[+-][0-9]{2}:[0-9]{2})?"
+)
+# publicationType ("Standard Action" vb.) sürüm notlarındaki Markdown tablosuna yazılır.
+YAYIN_TURU_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ()&/,.'-]{0,99}")
+DEGISIKLIK_ISARETCI_ANAHTARLARI = ("ad", "sha256", "boyut", "son_yayin_id", "yayin_sayisi")
+DEGISIKLIK_OZETI_ANAHTARLARI = (
+    "surum",
+    "etiket",
+    "olusturuldu_at",
+    "ofac_yayinlari",
+    "liste_farki",
+    "uyarilar",
+)
+YAYIN_ANAHTARLARI = (
+    "yayin_id",
+    "yayin_zamani",
+    "delta_tarihi",
+    "yayin_turu",
+    "ad",
+    "kaynak_url",
+    "sha256",
+    "boyut",
+    "eklenen",
+    "cikarilan",
+    "degisen",
+)
+LISTE_FARKI_ANAHTARLARI = (
+    "onceki_etiket",
+    "onceki_sha256",
+    "onceki_publish_date",
+    "sha256",
+    "publish_date",
+    "eklenen",
+    "cikarilan",
+    "degisen",
+)
 
 
 class AynaHatasi(Exception):
@@ -543,6 +611,505 @@ def onceki_ile_karsilastir(dosyalar: dict, onceki: dict) -> None:
         raise DogrulamaHatasi("; ".join(sorunlar))
 
 
+# --------------------------------------------------------------------------- değişiklik verisi
+
+
+def _tekrarla(is_, aciklama: str, *, yeniden_deneme: int, beklemeler: tuple, uyku):
+    """is_()'i indir() ile aynı kuralla yeniden dener: ağ hatası, 408/425/429 ve 5xx."""
+    son_hata: object = None
+    for deneme in range(yeniden_deneme + 1):
+        if deneme:
+            uyku(beklemeler[min(deneme - 1, len(beklemeler) - 1)] if beklemeler else 0)
+        try:
+            return is_()
+        except AynaHatasi:
+            raise
+        except urllib.error.HTTPError as hata:
+            hata.close()
+            if hata.code in (408, 425, 429) or hata.code >= 500:
+                son_hata = f"HTTP {hata.code}"
+                continue
+            raise IndirmeHatasi(f"{aciklama}: HTTP {hata.code}") from hata
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as hata:
+            son_hata = f"{type(hata).__name__}: {hata}"
+            continue
+    raise IndirmeHatasi(f"{aciklama} {yeniden_deneme + 1} denemede alınamadı ({son_hata})")
+
+
+def _json_getir(url: str, azami: int, zaman_asimi: float, adres_denetimi) -> object:
+    if not adres_denetimi(url):
+        raise DogrulamaHatasi(f"izin verilmeyen adres: {_adres_ozeti(url)}")
+    acici = urllib.request.build_opener(_DenetimliYonlendirme(adres_denetimi))
+    istek = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+        },
+    )
+    with acici.open(istek, timeout=zaman_asimi) as yanit:
+        if not adres_denetimi(yanit.geturl()):
+            raise DogrulamaHatasi(f"izin verilmeyen son adres: {_adres_ozeti(yanit.geturl())}")
+        if yanit.getcode() != 200:
+            raise IndirmeHatasi(f"{_adres_ozeti(url)}: beklenmeyen HTTP durumu {yanit.getcode()}")
+        veri = yanit.read(azami + 1)
+    if len(veri) > azami:
+        raise DogrulamaHatasi(f"{_adres_ozeti(url)} yanıtı {azami} bayt sınırını aşıyor")
+    try:
+        return json.loads(veri.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as hata:
+        raise DogrulamaHatasi(f"{_adres_ozeti(url)} yanıtı JSON değil") from hata
+
+
+def yayin_gecmisi_al(
+    simdi: datetime,
+    *,
+    gecmis_koku: str = DEGISIKLIK_GECMIS_KOKU,
+    sayi: int = DEGISIKLIK_YAYIN_SAYISI,
+    yeniden_deneme: int = YENIDEN_DENEME,
+    beklemeler: tuple = BEKLEMELER_S,
+    zaman_asimi: float = 60,
+    uyku=time.sleep,
+    adres_denetimi=resmi_adres_mi,
+) -> list:
+    """OFAC'ın en yeni `sayi` yayınını [{yayin_id, yayin_zamani}] olarak, yeniden eskiye döner.
+
+    Geçmiş yıl başına yayımlanır; bu yıl (UTC) yetmezse önceki yıl da okunur.
+    """
+
+    def bicim(mesaj: str) -> DogrulamaHatasi:
+        return DogrulamaHatasi(f"OFAC değişiklik geçmişi beklenen biçimde değil: {mesaj}")
+
+    yil = simdi.astimezone(timezone.utc).year
+    yayinlar: dict[int, str] = {}
+    for y in (yil, yil - 1):
+        url = f"{gecmis_koku}{y}"
+        veri = _tekrarla(
+            lambda: _json_getir(url, GECMIS_AZAMI_BAYT, zaman_asimi, adres_denetimi),
+            f"OFAC değişiklik geçmişi ({y})",
+            yeniden_deneme=yeniden_deneme,
+            beklemeler=beklemeler,
+            uyku=uyku,
+        )
+        if not isinstance(veri, list):
+            raise bicim(f"{y} liste değil")
+        for kayit in veri:
+            if not isinstance(kayit, dict):
+                raise bicim(f"{y} kaydı nesne değil")
+            yayin_id = kayit.get("publicationID")
+            zaman = kayit.get("datePublished")
+            if not _tamsayi_mi(yayin_id) or not 0 < yayin_id < 10**10:
+                raise bicim(f"publicationID {yayin_id!r}")
+            if not isinstance(zaman, str) or not YAYIN_ZAMANI_RE.fullmatch(zaman):
+                raise bicim(f"datePublished {zaman!r}")
+            if yayin_id in yayinlar:
+                raise bicim(f"publicationID {yayin_id} tekrar ediyor")
+            yayinlar[yayin_id] = zaman
+        if len(yayinlar) >= sayi:
+            break
+    if not yayinlar:
+        raise bicim("yayın yok")
+    return [
+        {"yayin_id": yayin_id, "yayin_zamani": zaman}
+        for yayin_id, zaman in sorted(yayinlar.items(), reverse=True)[:sayi]
+    ]
+
+
+def delta_dogrula(yol: str, yayin_zamani: str) -> dict:
+    """OFAC DeltaFile/1.0 XML'ini akışla okuyup doğrular; eklenen/çıkarılan/değişen id'leri döner.
+
+    Denetimler: iyi biçimli XML; kök `{DeltaFile/1.0}sanctionsData`; tek publicationInfo ve tek
+    entities; datePublished'in günü geçmişteki yayın zamanının günüyle aynı (yönlendirme başka
+    bir yayının dosyasını verirse yakalanır); her entity'nin id'si pozitif tamsayı ve tekil,
+    action yok, "add" ya da "remove".
+    """
+    derinlik = 0
+    kok = None
+    yol_adlari: list[str] = []
+    yayin_bilgisi = 0
+    entities = 0
+    tarih = None
+    tur = None
+    kumeler: dict[str | None, list[int]] = {"add": [], "remove": [], None: []}
+    gorulen: set[int] = set()
+    try:
+        kaynak = open(yol, "rb")
+    except OSError as hata:
+        raise DogrulamaHatasi(f"delta dosyası açılamadı: {hata}") from hata
+    try:
+        for olay, oge in ET.iterparse(kaynak, events=("start", "end")):
+            if olay == "start":
+                derinlik += 1
+                yol_adlari.append(_yerel_ad(oge.tag))
+                if derinlik == 1:
+                    kok = oge
+                    if oge.tag != f"{{{DELTA_AD_ALANI}}}sanctionsData":
+                        raise DogrulamaHatasi(
+                            f"delta kök öğesi {{{DELTA_AD_ALANI}}}sanctionsData değil: {oge.tag!r}"
+                        )
+                continue
+            ad = yol_adlari.pop()
+            if derinlik == 3 and yol_adlari[1] == "entities" and ad == "entity":
+                kimlik = oge.get("id") or ""
+                if not RAKAM_RE.fullmatch(kimlik) or kimlik.startswith("0"):
+                    raise DogrulamaHatasi(f"entity id pozitif tamsayı değil: {kimlik!r}")
+                eylem = oge.get("action")
+                if eylem not in kumeler:
+                    raise DogrulamaHatasi(f"entity {kimlik} action değeri bilinmiyor: {eylem!r}")
+                if int(kimlik) in gorulen:
+                    raise DogrulamaHatasi(f"entity {kimlik} delta içinde tekrar ediyor")
+                gorulen.add(int(kimlik))
+                kumeler[eylem].append(int(kimlik))
+                oge.clear()
+            elif derinlik == 2:
+                if ad == "publicationInfo":
+                    yayin_bilgisi += 1
+                    for cocuk in oge:
+                        cocuk_adi = _yerel_ad(cocuk.tag)
+                        if cocuk_adi == "datePublished":
+                            tarih = (cocuk.text or "").strip()
+                        elif cocuk_adi == "publicationType":
+                            tur = (cocuk.text or "").strip()
+                elif ad == "entities":
+                    entities += 1
+                kok.clear()
+            derinlik -= 1
+    except ET.ParseError as hata:
+        raise DogrulamaHatasi(f"delta XML iyi biçimli değil: {hata}") from hata
+    finally:
+        kaynak.close()
+
+    if kok is None:
+        raise DogrulamaHatasi("delta XML kök öğesi yok")
+    if yayin_bilgisi != 1:
+        raise DogrulamaHatasi(f"delta publicationInfo öğesi {yayin_bilgisi} kez bulundu")
+    if entities != 1:
+        raise DogrulamaHatasi(f"delta entities öğesi {entities} kez bulundu")
+    if not tarih or not DELTA_TARIHI_RE.fullmatch(tarih):
+        raise DogrulamaHatasi(f"delta datePublished geçersiz: {tarih!r}")
+    if tarih[:10] != yayin_zamani[:10]:
+        raise DogrulamaHatasi(
+            f"delta datePublished ({tarih}) yayının gününe ({yayin_zamani[:10]}) uymuyor"
+        )
+    if not tur or not YAYIN_TURU_RE.fullmatch(tur):
+        raise DogrulamaHatasi(f"delta publicationType geçersiz: {tur!r}")
+    return {
+        "delta_tarihi": tarih,
+        "yayin_turu": tur,
+        "eklenen": sorted(kumeler["add"]),
+        "cikarilan": sorted(kumeler["remove"]),
+        "degisen": sorted(kumeler[None]),
+    }
+
+
+def _normal_bicim(oge) -> list:
+    """sdnEntry alt ağacının ad alanından ve girintiden bağımsız biçimi."""
+    return [
+        _yerel_ad(oge.tag),
+        sorted((_yerel_ad(anahtar), deger) for anahtar, deger in oge.attrib.items()),
+        (oge.text or "").strip(),
+        [_normal_bicim(cocuk) for cocuk in oge],
+    ]
+
+
+def kayit_ozetleri(yol: str) -> dict:
+    """OFAC XML'indeki her sdnEntry için {uid: normalize kaydın sha256'sı} döner.
+
+    Normalize kayıt: öğe adları ad alanı öneki olmadan, öznitelikler sıralı, metinler kırpılmış,
+    alt öğeler belge sırasında. Girinti ve ad alanı değişikliği kaydı "değişmiş" yapmaz; alt
+    öğelerin sırası değişirse yapar.
+    """
+    derinlik = 0
+    kok = None
+    ozetler: dict[int, str] = {}
+    try:
+        kaynak = open(yol, "rb")
+    except OSError as hata:
+        raise DogrulamaHatasi(f"dosya açılamadı: {hata}") from hata
+    try:
+        for olay, oge in ET.iterparse(kaynak, events=("start", "end")):
+            if olay == "start":
+                derinlik += 1
+                if derinlik == 1:
+                    kok = oge
+                    if _yerel_ad(oge.tag) != "sdnList":
+                        raise DogrulamaHatasi(f"kök öğe sdnList değil: {_yerel_ad(oge.tag)!r}")
+                continue
+            if derinlik == 2:
+                if _yerel_ad(oge.tag) == "sdnEntry":
+                    uidler = [c for c in oge if _yerel_ad(c.tag) == "uid"]
+                    metin = (uidler[0].text or "").strip() if len(uidler) == 1 else ""
+                    if not RAKAM_RE.fullmatch(metin):
+                        raise DogrulamaHatasi(f"sdnEntry uid'i tek ve tamsayı değil: {metin!r}")
+                    uid = int(metin)
+                    if uid in ozetler:
+                        raise DogrulamaHatasi(f"sdnEntry uid {uid} tekrar ediyor")
+                    normal = json.dumps(
+                        _normal_bicim(oge), ensure_ascii=False, separators=(",", ":")
+                    )
+                    ozetler[uid] = hashlib.sha256(normal.encode("utf-8")).hexdigest()
+                kok.clear()
+            derinlik -= 1
+    except ET.ParseError as hata:
+        raise DogrulamaHatasi(f"XML iyi biçimli değil: {hata}") from hata
+    finally:
+        kaynak.close()
+    if kok is None:
+        raise DogrulamaHatasi("XML kök öğesi yok")
+    return ozetler
+
+
+def liste_farki_hesapla(eski: dict, yeni: dict) -> dict:
+    """İki {uid: özet} eşlemesinin farkı: eklenen, çıkarılan ve özeti değişen uid'ler (sıralı)."""
+    return {
+        "eklenen": sorted(yeni.keys() - eski.keys()),
+        "cikarilan": sorted(eski.keys() - yeni.keys()),
+        "degisen": sorted(uid for uid in yeni.keys() & eski.keys() if yeni[uid] != eski[uid]),
+    }
+
+
+def _dosya_ozeti(yol: str) -> tuple[str, int]:
+    ozet = hashlib.sha256()
+    boyut = 0
+    with open(yol, "rb") as dosya:
+        while True:
+            parca = dosya.read(PARCA_BOYUTU)
+            if not parca:
+                break
+            ozet.update(parca)
+            boyut += len(parca)
+    return ozet.hexdigest(), boyut
+
+
+def _kisa(metin: str, azami: int = 500) -> str:
+    metin = " ".join(str(metin).split())
+    return metin if len(metin) <= azami else metin[: azami - 1] + "…"
+
+
+def deltalari_indir(
+    gecmis: list,
+    cikti: str,
+    *,
+    delta_koku: str = DEGISIKLIK_DELTA_KOKU,
+    uyku=time.sleep,
+    adres_denetimi=resmi_adres_mi,
+) -> tuple[list, list]:
+    """Geçmişteki her yayının delta XML'ini indirip doğrular.
+
+    (yayınlar, [(geçici yol, Release adı)]) döner; dosyalar geçici adlarındadır. Hata olursa
+    indirilenler silinir ve hata yükseltilir.
+    """
+    yayinlar = []
+    gecici_dosyalar = []
+    toplam = 0
+    try:
+        for kayit in gecmis:
+            yayin_id = kayit["yayin_id"]
+            ad = f"ofac-delta-{yayin_id}.xml"
+            gecici = os.path.join(cikti, f".{ad}.part")
+            gecici_dosyalar.append((gecici, ad))
+            try:
+                sha256, boyut = indir(
+                    f"{delta_koku}{yayin_id}", gecici, uyku=uyku, adres_denetimi=adres_denetimi
+                )
+                toplam += boyut
+                if toplam > DELTA_TOPLAM_AZAMI_BAYT:
+                    raise DogrulamaHatasi(
+                        f"delta dosyaları toplamı {DELTA_TOPLAM_AZAMI_BAYT} bayt sınırını aşıyor"
+                    )
+                bilgi = delta_dogrula(gecici, kayit["yayin_zamani"])
+            except AynaHatasi as hata:
+                raise type(hata)(f"yayın {yayin_id}: {hata}") from hata
+            yayinlar.append(
+                {
+                    "yayin_id": yayin_id,
+                    "yayin_zamani": kayit["yayin_zamani"],
+                    "delta_tarihi": bilgi["delta_tarihi"],
+                    "yayin_turu": bilgi["yayin_turu"],
+                    "ad": ad,
+                    "kaynak_url": f"{DEGISIKLIK_DELTA_KOKU}{yayin_id}",
+                    "sha256": sha256,
+                    "boyut": boyut,
+                    "eklenen": bilgi["eklenen"],
+                    "cikarilan": bilgi["cikarilan"],
+                    "degisen": bilgi["degisen"],
+                }
+            )
+        gorulen: dict[str, int] = {}
+        for yayin in yayinlar:
+            onceki_id = gorulen.setdefault(yayin["sha256"], yayin["yayin_id"])
+            if onceki_id != yayin["yayin_id"]:
+                raise DogrulamaHatasi(
+                    f"yayın {onceki_id} ve {yayin['yayin_id']} aynı delta dosyasını veriyor"
+                )
+    except BaseException:
+        for gecici, _ in gecici_dosyalar:
+            _sil(gecici)
+        raise
+    return yayinlar, gecici_dosyalar
+
+
+def liste_farklari(
+    dosyalar: dict, yeni_yollar: dict, onceki: dict | None, onceki_dizin: str | None
+) -> tuple[dict, list]:
+    """Her liste için önceki sürümün XML'ine göre uid farkı; (liste_farki, uyarılar) döner.
+
+    Önceki dosya yoksa ya da manifestteki özetine uymuyorsa o liste atlanır ve uyarı eklenir.
+    Özet aynıysa dosya çözümlenmez, fark boştur.
+    """
+    farklar: dict = {}
+    uyarilar: list = []
+    eski_dosyalar = (onceki or {}).get("dosyalar") or {}
+    for anahtar, yeni in dosyalar.items():
+        eski = eski_dosyalar.get(anahtar)
+        if onceki is None or not isinstance(eski, dict):
+            uyarilar.append(f"{anahtar}: önceki sürüm yok, liste farkı üretilmedi")
+            continue
+        kayit = {
+            "onceki_etiket": onceki["etiket"],
+            "onceki_sha256": eski["sha256"],
+            "onceki_publish_date": eski["publish_date"],
+            "sha256": yeni["sha256"],
+            "publish_date": yeni["publish_date"],
+        }
+        if eski["sha256"] == yeni["sha256"]:
+            kayit.update(eklenen=[], cikarilan=[], degisen=[])
+            farklar[anahtar] = kayit
+            continue
+        eski_yol = os.path.join(onceki_dizin, eski["ad"]) if onceki_dizin else None
+        if eski_yol is None or not os.path.isfile(eski_yol):
+            uyarilar.append(
+                f"{anahtar}: önceki sürümün {eski['ad']} dosyası yok, liste farkı üretilmedi"
+            )
+            continue
+        try:
+            if _dosya_ozeti(eski_yol) != (eski["sha256"], eski["boyut"]):
+                uyarilar.append(
+                    f"{anahtar}: önceki {eski['ad']} önceki manifestin özetine uymuyor, "
+                    "liste farkı üretilmedi"
+                )
+                continue
+            kayit.update(
+                liste_farki_hesapla(kayit_ozetleri(eski_yol), kayit_ozetleri(yeni_yollar[anahtar]))
+            )
+        except (AynaHatasi, OSError) as hata:
+            uyarilar.append(_kisa(f"{anahtar}: liste farkı üretilemedi: {hata}"))
+            continue
+        farklar[anahtar] = kayit
+    return farklar, uyarilar
+
+
+def degisiklik_ozeti_baytlari(ozet: dict) -> bytes:
+    veri = (json.dumps(ozet, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(veri) > DEGISIKLIK_OZETI_AZAMI_BAYT:
+        raise DogrulamaHatasi(
+            f"{DEGISIKLIK_OZETI_AD} {len(veri)} bayt; sınır {DEGISIKLIK_OZETI_AZAMI_BAYT}"
+        )
+    return veri
+
+
+def _uid_listesi_mi(deger: object) -> bool:
+    return (
+        isinstance(deger, list)
+        and all(_tamsayi_mi(uid) and uid > 0 for uid in deger)
+        and all(a < b for a, b in zip(deger, deger[1:]))
+    )
+
+
+def degisiklik_ozeti_dogrula(ozet: object, etiket: str | None = None) -> None:
+    """degisiklikler.json'un sözleşmeye uyduğunu denetler; uymazsa DogrulamaHatasi."""
+
+    def hata(mesaj: str) -> DogrulamaHatasi:
+        return DogrulamaHatasi(f"{DEGISIKLIK_OZETI_AD} sözleşmeye uymuyor: {mesaj}")
+
+    if not isinstance(ozet, dict) or sorted(ozet) != sorted(DEGISIKLIK_OZETI_ANAHTARLARI):
+        raise hata("üst düzey anahtarlar")
+    if not _tamsayi_mi(ozet["surum"]) or ozet["surum"] != DEGISIKLIK_OZETI_SURUM:
+        raise hata(f"surum {ozet['surum']!r}")
+    if not isinstance(ozet["etiket"], str) or not ETIKET_RE.fullmatch(ozet["etiket"]):
+        raise hata(f"etiket {ozet['etiket']!r}")
+    if etiket is not None and ozet["etiket"] != etiket:
+        raise hata(f"etiket {ozet['etiket']} manifestteki {etiket} değil")
+    if not isinstance(ozet["olusturuldu_at"], str) or not ISO_RE.fullmatch(ozet["olusturuldu_at"]):
+        raise hata("olusturuldu_at")
+    if not isinstance(ozet["uyarilar"], list) or not all(
+        isinstance(u, str) for u in ozet["uyarilar"]
+    ):
+        raise hata("uyarilar")
+    akis = ozet["ofac_yayinlari"]
+    if akis is not None:
+        if not isinstance(akis, dict) or sorted(akis) != ["gecmis_url", "yayinlar"]:
+            raise hata("ofac_yayinlari anahtarları")
+        if akis["gecmis_url"] != DEGISIKLIK_GECMIS_KOKU:
+            raise hata("ofac_yayinlari.gecmis_url")
+        yayinlar = akis["yayinlar"]
+        if not isinstance(yayinlar, list) or not yayinlar:
+            raise hata("ofac_yayinlari.yayinlar boş ya da liste değil")
+        adlar = set()
+        onceki_id = None
+        for yayin in yayinlar:
+            if not isinstance(yayin, dict) or sorted(yayin) != sorted(YAYIN_ANAHTARLARI):
+                raise hata("yayın alanları")
+            yayin_id = yayin["yayin_id"]
+            if not _tamsayi_mi(yayin_id) or not 0 < yayin_id < 10**10:
+                raise hata(f"yayin_id {yayin_id!r}")
+            if onceki_id is not None and yayin_id >= onceki_id:
+                raise hata("yayınlar yeniden eskiye sıralı değil")
+            onceki_id = yayin_id
+            if yayin["ad"] != f"ofac-delta-{yayin_id}.xml" or not DELTA_AD_RE.fullmatch(yayin["ad"]):
+                raise hata(f"yayın {yayin_id} ad")
+            if yayin["ad"] in adlar:
+                raise hata(f"yayın {yayin_id} ad tekrar ediyor")
+            adlar.add(yayin["ad"])
+            if yayin["kaynak_url"] != f"{DEGISIKLIK_DELTA_KOKU}{yayin_id}":
+                raise hata(f"yayın {yayin_id} kaynak_url")
+            if not isinstance(yayin["yayin_zamani"], str) or not YAYIN_ZAMANI_RE.fullmatch(
+                yayin["yayin_zamani"]
+            ):
+                raise hata(f"yayın {yayin_id} yayin_zamani")
+            if not isinstance(yayin["delta_tarihi"], str) or not DELTA_TARIHI_RE.fullmatch(
+                yayin["delta_tarihi"]
+            ):
+                raise hata(f"yayın {yayin_id} delta_tarihi")
+            if not isinstance(yayin["yayin_turu"], str) or not YAYIN_TURU_RE.fullmatch(
+                yayin["yayin_turu"]
+            ):
+                raise hata(f"yayın {yayin_id} yayin_turu")
+            if not isinstance(yayin["sha256"], str) or not SHA256_RE.fullmatch(yayin["sha256"]):
+                raise hata(f"yayın {yayin_id} sha256")
+            if not _tamsayi_mi(yayin["boyut"]) or not 0 < yayin["boyut"] <= AZAMI_BOYUT:
+                raise hata(f"yayın {yayin_id} boyut")
+            for alan in ("eklenen", "cikarilan", "degisen"):
+                if not _uid_listesi_mi(yayin[alan]):
+                    raise hata(f"yayın {yayin_id} {alan}")
+    farklar = ozet["liste_farki"]
+    if not isinstance(farklar, dict):
+        raise hata("liste_farki nesne değil")
+    for anahtar, fark in farklar.items():
+        if not isinstance(fark, dict) or sorted(fark) != sorted(LISTE_FARKI_ANAHTARLARI):
+            raise hata(f"liste_farki.{anahtar} alanları")
+        if not isinstance(fark["onceki_etiket"], str) or not ETIKET_RE.fullmatch(
+            fark["onceki_etiket"]
+        ):
+            raise hata(f"liste_farki.{anahtar}.onceki_etiket")
+        for alan in ("onceki_sha256", "sha256"):
+            if not isinstance(fark[alan], str) or not SHA256_RE.fullmatch(fark[alan]):
+                raise hata(f"liste_farki.{anahtar}.{alan}")
+        for alan in ("onceki_publish_date", "publish_date"):
+            try:
+                tarih_coz(fark[alan])
+            except DogrulamaHatasi as alt:
+                raise hata(f"liste_farki.{anahtar}.{alan}") from alt
+        for alan in ("eklenen", "cikarilan", "degisen"):
+            if not _uid_listesi_mi(fark[alan]):
+                raise hata(f"liste_farki.{anahtar}.{alan}")
+        if fark["onceki_sha256"] == fark["sha256"] and (
+            fark["eklenen"] or fark["cikarilan"] or fark["degisen"]
+        ):
+            raise hata(f"liste_farki.{anahtar}: aynı dosyada fark var")
+
+
 # --------------------------------------------------------------------------- manifest
 
 
@@ -564,7 +1131,9 @@ def manifest_dogrula(manifest: object, beklenen_anahtarlar=None) -> None:
 
     if not isinstance(manifest, dict):
         raise hata("nesne değil")
-    if sorted(manifest) != sorted(MANIFEST_ANAHTARLARI):
+    if not set(MANIFEST_ANAHTARLARI) <= set(manifest) <= set(
+        MANIFEST_ANAHTARLARI + MANIFEST_ISTEGE_BAGLI
+    ):
         raise hata(f"üst düzey anahtarlar {sorted(manifest)}")
     if not _tamsayi_mi(manifest["surum"]) or manifest["surum"] != MANIFEST_SURUM:
         raise hata(f"surum {manifest['surum']!r}")
@@ -613,6 +1182,29 @@ def manifest_dogrula(manifest: object, beklenen_anahtarlar=None) -> None:
             raise hata(f"{anahtar}.record_count {girdi['record_count']!r}")
         if girdi["resmi_sha256"] != girdi["sha256"]:
             raise hata(f"{anahtar}.resmi_sha256 sha256 ile aynı değil")
+    if "degisiklikler" in manifest:
+        isaretci = manifest["degisiklikler"]
+        if not isinstance(isaretci, dict) or sorted(isaretci) != sorted(
+            DEGISIKLIK_ISARETCI_ANAHTARLARI
+        ):
+            raise hata("degisiklikler alanları hatalı")
+        if isaretci["ad"] != DEGISIKLIK_OZETI_AD or isaretci["ad"] in adlar:
+            raise hata(f"degisiklikler.ad {isaretci['ad']!r}")
+        if not isinstance(isaretci["sha256"], str) or not SHA256_RE.fullmatch(isaretci["sha256"]):
+            raise hata("degisiklikler.sha256")
+        if not _tamsayi_mi(isaretci["boyut"]) or not (
+            0 < isaretci["boyut"] <= DEGISIKLIK_OZETI_AZAMI_BAYT
+        ):
+            raise hata(f"degisiklikler.boyut {isaretci['boyut']!r}")
+        son = isaretci["son_yayin_id"]
+        sayi = isaretci["yayin_sayisi"]
+        if not _tamsayi_mi(sayi) or not 0 <= sayi <= 1000:
+            raise hata(f"degisiklikler.yayin_sayisi {sayi!r}")
+        if son is None:
+            if sayi != 0:
+                raise hata("degisiklikler: son_yayin_id yokken yayin_sayisi 0 değil")
+        elif not _tamsayi_mi(son) or not 0 < son < 10**10 or sayi == 0:
+            raise hata(f"degisiklikler.son_yayin_id {son!r}")
 
 
 def manifest_baytlari(manifest: dict) -> bytes:
@@ -639,9 +1231,20 @@ def manifest_oku(yol: str) -> dict:
 
 
 def degisti_mi(yeni: dict, onceki) -> bool:
-    """Yeni manifestteki dosyalardan biri öncekinden farklıysa (veya önceki yoksa) True."""
+    """Yeni manifestteki dosyalardan biri öncekinden farklıysa (veya önceki yoksa) True.
+
+    Yeni manifest OFAC yayın verisi taşıyorsa (son_yayin_id dolu) ve öncekinde bu veri yoksa ya
+    da en yeni yayın farklıysa da True: dosyalar aynıyken gelen yeni bir OFAC yayını ya da yayın
+    verisinin ilk kez eklenmesi yeni sürüm gerektirir. Yayın verisi alınamayan (son_yayin_id
+    boş) bir çalıştırma, dosyalar aynıysa yayın verisi olan önceki sürümün yerine geçmez.
+    """
     if not onceki:
         return True
+    yeni_son = (yeni.get("degisiklikler") or {}).get("son_yayin_id")
+    if yeni_son is not None:
+        eski_isaretci = onceki.get("degisiklikler")
+        if eski_isaretci is None or eski_isaretci.get("son_yayin_id") != yeni_son:
+            return True
     eski_dosyalar = onceki.get("dosyalar") or {}
     yeni_dosyalar = yeni.get("dosyalar") or {}
     if sorted(eski_dosyalar) != sorted(yeni_dosyalar):
@@ -655,7 +1258,38 @@ def degisti_mi(yeni: dict, onceki) -> bool:
     return False
 
 
-def notlar_olustur(manifest: dict) -> str:
+def _degisiklik_notlari(ozet: dict) -> list:
+    satirlar = ["", "### Değişiklikler", ""]
+    akis = ozet["ofac_yayinlari"]
+    if akis is None:
+        satirlar.append("OFAC değişiklik akışı bu sürümde yok (alınamadı; uyarılara bakın).")
+    else:
+        satirlar += [
+            f"OFAC'ın resmî değişiklik akışındaki en yeni {len(akis['yayinlar'])} yayının delta "
+            f"dosyası (`ofac-delta-<id>.xml`) ve özeti `{DEGISIKLIK_OZETI_AD}` içindedir.",
+            "",
+            "| Yayın | Zaman | Tür | Eklenen | Çıkarılan | Değişen |",
+            "|---|---|---|---|---|---|",
+        ]
+        for yayin in akis["yayinlar"][:10]:
+            satirlar.append(
+                f"| {yayin['yayin_id']} | {yayin['yayin_zamani'][:16]} | {yayin['yayin_turu']} "
+                f"| {len(yayin['eklenen'])} | {len(yayin['cikarilan'])} | {len(yayin['degisen'])} |"
+            )
+    if ozet["liste_farki"]:
+        satirlar += ["", "Önceki sürüme göre uid farkı:", ""]
+        for anahtar, fark in ozet["liste_farki"].items():
+            satirlar.append(
+                f"- `{anahtar}` (`{fark['onceki_etiket']}` → bu sürüm): {len(fark['eklenen'])} "
+                f"eklenen, {len(fark['cikarilan'])} çıkarılan, {len(fark['degisen'])} değişen"
+            )
+    if ozet["uyarilar"]:
+        satirlar += ["", "Uyarılar:", ""]
+        satirlar += [f"- {uyari}" for uyari in ozet["uyarilar"]]
+    return satirlar
+
+
+def notlar_olustur(manifest: dict, degisiklik_ozeti: dict | None = None) -> str:
     satirlar = [
         f"OFAC yaptırım listelerinin bayt bayt aynası — `{manifest['etiket']}` "
         f"({manifest['olusturuldu_at']}).",
@@ -673,6 +1307,8 @@ def notlar_olustur(manifest: dict) -> str:
         satirlar.append(
             f"- `{girdi['ad']}` kaynağı: {girdi['kaynak_url']} (indirildi {girdi['indirildi_at']})"
         )
+    if degisiklik_ozeti is not None:
+        satirlar += _degisiklik_notlari(degisiklik_ozeti)
     satirlar += [
         "",
         "Dosyalar OFAC'ın yayımladığı dosyaların değiştirilmemiş kopyasıdır; doğrulama için "
@@ -694,7 +1330,57 @@ def ozet_satiri(manifest: dict, degisti: bool) -> str:
             f"{anahtar} {girdi['ad']} publish_date={girdi['publish_date']} "
             f"record_count={girdi['record_count']} boyut={girdi['boyut']} sha256={girdi['sha256']}"
         )
+    isaretci = manifest.get("degisiklikler")
+    if isaretci is not None:
+        parcalar.append(
+            f"degisiklikler son_yayin_id={isaretci['son_yayin_id']} "
+            f"yayin_sayisi={isaretci['yayin_sayisi']}"
+        )
     return " | ".join(parcalar)
+
+
+def yayin_dosyalari(dizin: str) -> list:
+    """Release'e konacak dosya adları; her dosya manifestteki özetine karşı denetlenir.
+
+    Sıra: veri dosyaları, (varsa) degisiklikler.json ve delta dosyaları, en son manifest.json.
+    """
+    manifest = manifest_oku(os.path.join(dizin, "manifest.json"))
+    beklenen: list[tuple[str, str, int]] = [
+        (girdi["ad"], girdi["sha256"], girdi["boyut"]) for girdi in manifest["dosyalar"].values()
+    ]
+    isaretci = manifest.get("degisiklikler")
+    if isaretci is not None:
+        yol = os.path.join(dizin, isaretci["ad"])
+        try:
+            with open(yol, "rb") as dosya:
+                veri = dosya.read(DEGISIKLIK_OZETI_AZAMI_BAYT + 1)
+        except OSError as hata:
+            raise DogrulamaHatasi(f"{isaretci['ad']} okunamadı: {hata}") from hata
+        if (hashlib.sha256(veri).hexdigest(), len(veri)) != (isaretci["sha256"], isaretci["boyut"]):
+            raise DogrulamaHatasi(f"{isaretci['ad']} manifestteki özetine uymuyor")
+        try:
+            ozet = json.loads(veri.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as hata:
+            raise DogrulamaHatasi(f"{isaretci['ad']} geçerli UTF-8 JSON değil") from hata
+        degisiklik_ozeti_dogrula(ozet, manifest["etiket"])
+        yayinlar = (ozet["ofac_yayinlari"] or {}).get("yayinlar") or []
+        son = yayinlar[0]["yayin_id"] if yayinlar else None
+        if (son, len(yayinlar)) != (isaretci["son_yayin_id"], isaretci["yayin_sayisi"]):
+            raise DogrulamaHatasi(f"{isaretci['ad']} yayınları manifestteki işaretçiye uymuyor")
+        beklenen.append((isaretci["ad"], isaretci["sha256"], isaretci["boyut"]))
+        beklenen += [(yayin["ad"], yayin["sha256"], yayin["boyut"]) for yayin in yayinlar]
+    adlar = []
+    for ad, sha256, boyut in beklenen:
+        if ad in adlar or ad == "manifest.json":
+            raise DogrulamaHatasi(f"Release dosya adı tekrar ediyor: {ad}")
+        try:
+            gercek = _dosya_ozeti(os.path.join(dizin, ad))
+        except OSError as hata:
+            raise DogrulamaHatasi(f"{ad} okunamadı: {hata}") from hata
+        if gercek != (sha256, boyut):
+            raise DogrulamaHatasi(f"{ad} manifestteki özetine uymuyor")
+        adlar.append(ad)
+    return adlar + ["manifest.json"]
 
 
 def _github_ciktisi_yaz(degerler: dict) -> None:
@@ -732,6 +1418,23 @@ def _ayristirici() -> argparse.ArgumentParser:
     )
     ayr.add_argument("--yeni", help="--degisti-mi ile: yeni manifest.json yolu")
     ayr.add_argument(
+        "--onceki-dizin",
+        help="önceki sürümün sdn.xml ve consolidated.xml dosyalarının dizini (uid bazlı liste "
+        "farkı için; dosyalar önceki manifestin özetine karşı denetlenir)",
+    )
+    ayr.add_argument(
+        "--degisiklikler-kapali",
+        action="store_true",
+        help="değişiklik verisini (OFAC delta akışı, liste farkı, degisiklikler.json) üretmez; "
+        "manifest bu özellikten önceki biçimde kalır",
+    )
+    ayr.add_argument(
+        "--yayin-dosyalari",
+        metavar="DIZIN",
+        help="indirme yapmadan DIZIN'deki manifesti ve dosyaları denetler, Release'e konacak "
+        "dosya adlarını satır satır yazar",
+    )
+    ayr.add_argument(
         "--gerileme-denetimini-atla",
         action="store_true",
         help="önceki manifeste göre gerileme denetimini atlar (Publish_Date geriye gitmesi, "
@@ -763,10 +1466,21 @@ def main(
     uyku=time.sleep,
     saat=None,
     adres_denetimi=resmi_adres_mi,
+    gecmis_koku: str = DEGISIKLIK_GECMIS_KOKU,
+    delta_koku: str = DEGISIKLIK_DELTA_KOKU,
 ) -> int:
+    # gecmis_koku ve delta_koku yalnızca testler içindir; çıktıya her zaman resmî adresler yazılır.
     saat = saat or (lambda: datetime.now(timezone.utc))
     ayr = _ayristirici()
     args = ayr.parse_args(argv)
+
+    if args.yayin_dosyalari:
+        try:
+            adlar = yayin_dosyalari(args.yayin_dosyalari)
+        except AynaHatasi as hata:
+            return _hata_bildir(hata)
+        print("\n".join(adlar))
+        return CIKIS_TAMAM
 
     if args.degisti_mi:
         if not args.yeni:
@@ -783,6 +1497,7 @@ def main(
         ayr.error("--cikti gerekli")
 
     gecici_dosyalar = []
+    degisiklikler_acik = not args.degisiklikler_kapali
     try:
         onceki = manifest_oku(args.onceki) if args.onceki else None
         os.makedirs(args.cikti, exist_ok=True)
@@ -791,24 +1506,38 @@ def main(
             liste["anahtar"]: resmi_ozet_al(liste, uyku=uyku, adres_denetimi=adres_denetimi)
             for liste in listeler
         }
-        if onceki is not None and sorted(onceki["dosyalar"]) == sorted(anahtarlar) and all(
-            onceki["dosyalar"][anahtar]["sha256"] == resmi[anahtar]["sha256"]
-            for anahtar in anahtarlar
-        ):
-            # Nabız: OFAC'ın resmî özetleri önceki sürümle aynı; dosya indirilmez, yalnız
-            # son_kontrol_at yenilenmiş manifest yazılır (iş akışı onu son sürüme yükler).
-            manifest = dict(onceki, son_kontrol_at=_iso(saat()))
-            manifest_dogrula(manifest, anahtarlar)
-            _atomik_yaz(os.path.join(args.cikti, "manifest.json"), manifest_baytlari(manifest))
-            _github_ciktisi_yaz(
-                {"etiket": manifest["etiket"], "degisti": "false", "nabiz": "true"}
+        gecmis = None
+        gecmis_hatasi = None
+        if degisiklikler_acik:
+            try:
+                gecmis = yayin_gecmisi_al(
+                    saat(), gecmis_koku=gecmis_koku, uyku=uyku, adres_denetimi=adres_denetimi
+                )
+            except AynaHatasi as hata:
+                # Değişiklik verisi isteğe bağlıdır: akış alınamazsa ayna yine çalışır.
+                gecmis_hatasi = _kisa(f"OFAC değişiklik geçmişi alınamadı: {hata}")
+                _uyari_bildir(gecmis_hatasi)
+        dosyalar_ayni = (
+            onceki is not None
+            and sorted(onceki["dosyalar"]) == sorted(anahtarlar)
+            and all(
+                onceki["dosyalar"][anahtar]["sha256"] == resmi[anahtar]["sha256"]
+                for anahtar in anahtarlar
             )
-            print(ozet_satiri(manifest, False) + " | nabız")
-            return CIKIS_TAMAM
+        )
+        # Yeni bir OFAC yayını dosyalar aynıyken de yeni sürüm gerektirir; önceki manifestte
+        # değişiklik verisi yoksa (ya da yayın listesi boşsa) ilk kez eklenir.
+        yeni_yayin = gecmis is not None and (
+            (onceki or {}).get("degisiklikler") or {}
+        ).get("son_yayin_id") != gecmis[0]["yayin_id"]
+        if dosyalar_ayni and not yeni_yayin:
+            return _nabiz_yaz(args.cikti, onceki, saat())
         dosyalar = {}
+        yeni_yollar = {}
         for liste in listeler:
             gecici = os.path.join(args.cikti, f".{liste['ad']}.part")
             gecici_dosyalar.append(gecici)
+            yeni_yollar[liste["anahtar"]] = gecici
             # "indirme_url" yalnızca testler içindir; manifestte her zaman resmî kaynak_url yazılır.
             url = liste.get("indirme_url", liste["kaynak_url"])
             try:
@@ -854,18 +1583,76 @@ def main(
                 )
             else:
                 onceki_ile_karsilastir(dosyalar, onceki)
-        manifest = manifest_olustur(dosyalar, saat())
-        manifest_dogrula(manifest, [liste["anahtar"] for liste in listeler])
+        an = saat()
+        manifest = manifest_olustur(dosyalar, an)
+
+        degisiklik_ozeti = None
+        degisiklik_verisi = None
+        delta_dosyalari: list = []
+        if degisiklikler_acik:
+            uyarilar = [gecmis_hatasi] if gecmis_hatasi else []
+            yayinlar = None
+            if gecmis is not None:
+                try:
+                    yayinlar, delta_dosyalari = deltalari_indir(
+                        gecmis,
+                        args.cikti,
+                        delta_koku=delta_koku,
+                        uyku=uyku,
+                        adres_denetimi=adres_denetimi,
+                    )
+                    gecici_dosyalar += [gecici for gecici, _ in delta_dosyalari]
+                except AynaHatasi as hata:
+                    mesaj = _kisa(f"OFAC delta dosyaları alınamadı: {hata}")
+                    _uyari_bildir(mesaj)
+                    uyarilar.append(mesaj)
+            farklar, fark_uyarilari = liste_farklari(
+                dosyalar, yeni_yollar, onceki, args.onceki_dizin
+            )
+            for mesaj in fark_uyarilari:
+                _uyari_bildir(mesaj)
+            uyarilar += fark_uyarilari
+            degisiklik_ozeti = {
+                "surum": DEGISIKLIK_OZETI_SURUM,
+                "etiket": manifest["etiket"],
+                "olusturuldu_at": manifest["olusturuldu_at"],
+                "ofac_yayinlari": (
+                    None
+                    if yayinlar is None
+                    else {"gecmis_url": DEGISIKLIK_GECMIS_KOKU, "yayinlar": yayinlar}
+                ),
+                "liste_farki": farklar,
+                "uyarilar": uyarilar,
+            }
+            degisiklik_ozeti_dogrula(degisiklik_ozeti, manifest["etiket"])
+            degisiklik_verisi = degisiklik_ozeti_baytlari(degisiklik_ozeti)
+            manifest["degisiklikler"] = {
+                "ad": DEGISIKLIK_OZETI_AD,
+                "sha256": hashlib.sha256(degisiklik_verisi).hexdigest(),
+                "boyut": len(degisiklik_verisi),
+                "son_yayin_id": yayinlar[0]["yayin_id"] if yayinlar else None,
+                "yayin_sayisi": len(yayinlar or []),
+            }
+        manifest_dogrula(manifest, anahtarlar)
         manifest_verisi = manifest_baytlari(manifest)
 
+        degisti = degisti_mi(manifest, onceki)
+        if not degisti and onceki is not None:
+            # Dosyalar ve OFAC yayın verisi önceki sürümle aynı (ör. yayın verisi bu kez
+            # alınamadı): yeni sürüm yerine nabız; tazelik ölçütü yine yenilenir.
+            return _nabiz_yaz(args.cikti, onceki, saat())
+
         # Bütün denetimler geçti: dosyaları son adlarına taşı, manifesti en son yaz.
-        for liste, gecici in zip(listeler, gecici_dosyalar):
-            os.replace(gecici, os.path.join(args.cikti, liste["ad"]))
+        for liste in listeler:
+            os.replace(yeni_yollar[liste["anahtar"]], os.path.join(args.cikti, liste["ad"]))
+        for gecici, ad in delta_dosyalari:
+            os.replace(gecici, os.path.join(args.cikti, ad))
+        if degisiklik_verisi is not None:
+            _atomik_yaz(os.path.join(args.cikti, DEGISIKLIK_OZETI_AD), degisiklik_verisi)
         _atomik_yaz(os.path.join(args.cikti, "manifest.json"), manifest_verisi)
 
-        degisti = degisti_mi(manifest, onceki)
         if args.notlar:
-            _atomik_yaz(args.notlar, notlar_olustur(manifest).encode("utf-8"))
+            _atomik_yaz(args.notlar, notlar_olustur(manifest, degisiklik_ozeti).encode("utf-8"))
         _github_ciktisi_yaz(
             {"etiket": manifest["etiket"], "degisti": "true" if degisti else "false", "nabiz": "false"}
         )
@@ -876,6 +1663,17 @@ def main(
     finally:
         for gecici in gecici_dosyalar:
             _sil(gecici)
+
+
+def _nabiz_yaz(cikti: str, onceki: dict, an: datetime) -> int:
+    """Nabız: önceki manifest yalnız son_kontrol_at yenilenerek yazılır (dosya indirilmez ya da
+    indirilenler yayımlanmaz); iş akışı onu son sürüme yükler."""
+    manifest = dict(onceki, son_kontrol_at=_iso(an))
+    manifest_dogrula(manifest)
+    _atomik_yaz(os.path.join(cikti, "manifest.json"), manifest_baytlari(manifest))
+    _github_ciktisi_yaz({"etiket": manifest["etiket"], "degisti": "false", "nabiz": "true"})
+    print(ozet_satiri(manifest, False) + " | nabız")
+    return CIKIS_TAMAM
 
 
 if __name__ == "__main__":

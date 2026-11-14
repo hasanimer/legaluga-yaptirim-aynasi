@@ -67,6 +67,13 @@ jobs:
             else
               echo "Önceki sürüm: $etiket"
               gh release download "$etiket" --pattern manifest.json --dir onceki
+              # Liste farkı (değişiklik verisi) için önceki XML'ler; betik onları önceki
+              # manifestin özetine karşı denetler. İndirilemezse yalnız liste farkı atlanır.
+              if ! gh release download "$etiket" --pattern sdn.xml --pattern consolidated.xml \
+                --dir onceki 2> onceki-xml-hata.txt; then
+                cat onceki-xml-hata.txt >&2
+                echo "::warning::Önceki sürümün XML dosyaları indirilemedi; liste farkı üretilmeyecek."
+              fi
             fi
           elif grep -q "HTTP 404" onceki-hata.txt; then
             echo "Önceki sürüm yok; ilk yayın yapılacak."
@@ -80,10 +87,16 @@ jobs:
         id: ayna
         env:
           GERILEME_DENETIMINI_ATLA: ${{ inputs.gerileme_denetimini_atla }}
+          # Depo değişkeni DEGISIKLIK_VERISI=kapali değişiklik verisini kapatır (geri dönüş yolu,
+          # README "Değişiklik verisi"); tanımsızsa açıktır.
+          DEGISIKLIK_VERISI: ${{ vars.DEGISIKLIK_VERISI }}
         run: |
           arg=(--cikti cikti --notlar notlar.md)
           if [[ -f onceki/manifest.json ]]; then
-            arg+=(--onceki onceki/manifest.json)
+            arg+=(--onceki onceki/manifest.json --onceki-dizin onceki)
+          fi
+          if [[ "$DEGISIKLIK_VERISI" == "kapali" ]]; then
+            arg+=(--degisiklikler-kapali)
           fi
           if [[ "$GERILEME_DENETIMINI_ATLA" == "true" ]]; then
             arg+=(--gerileme-denetimini-atla)
@@ -134,9 +147,18 @@ jobs:
             echo "::error::$ETIKET etiketinin varlığı denetlenemedi"
             exit 1
           fi
+          # Dosya listesi manifestten çıkar (veri dosyaları, varsa degisiklikler.json ve delta
+          # dosyaları, en son manifest.json); betik her dosyayı manifestteki özetine karşı denetler.
+          python3 scripts/ayna.py --yayin-dosyalari cikti > yayin-dosyalari.txt
+          yollar=()
+          while IFS= read -r ad; do
+            [[ "$ad" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || { echo "::error::Geçersiz dosya adı: $ad"; exit 1; }
+            yollar+=("cikti/$ad")
+          done < yayin-dosyalari.txt
+          (( ${#yollar[@]} >= 3 )) || { echo "::error::Yayın dosya listesi eksik"; exit 1; }
           echo "baslatildi=true" >> "$GITHUB_OUTPUT"
           gh release create "$ETIKET" \
-            cikti/sdn.xml cikti/consolidated.xml cikti/manifest.json \
+            "${yollar[@]}" \
             --latest \
             --title "OFAC aynası $ETIKET" \
             --notes-file notlar.md
@@ -148,20 +170,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ETIKET: ${{ steps.ayna.outputs.etiket }}
         run: |
+          adlar=()
+          while IFS= read -r ad; do
+            [[ "$ad" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || { echo "::error::Geçersiz dosya adı: $ad"; exit 1; }
+            adlar+=("$ad")
+          done < yayin-dosyalari.txt
+          beklenen=${#adlar[@]}
+          (( beklenen >= 3 )) || { echo "::error::Yayın dosya listesi eksik"; exit 1; }
           # GitHub API'si yayımdan hemen sonra eski değer döndürebilir; okumalar birkaç kez denenir.
           for deneme in 1 2 3 4 5 6; do
             if gh api "repos/$GH_REPO/releases/tags/$ETIKET" > yayin.json \
               && [[ "$(jq -r .draft yayin.json)" == "false" ]] \
-              && [[ "$(jq '.assets | length' yayin.json)" == "3" ]]; then
+              && [[ "$(jq '.assets | length' yayin.json)" == "$beklenen" ]]; then
               break
             fi
             if (( deneme == 6 )); then
-              echo "::error::Sürüm okunamadı, taslak kaldı ya da 3 dosyası yok"
+              echo "::error::Sürüm okunamadı, taslak kaldı ya da $beklenen dosyası yok"
               exit 1
             fi
             sleep 5
           done
-          for ad in sdn.xml consolidated.xml manifest.json; do
+          for ad in "${adlar[@]}"; do
             uzak_boyut=$(jq -r --arg ad "$ad" '.assets[] | select(.name == $ad) | .size' yayin.json)
             yerel_boyut=$(stat -c %s "cikti/$ad")
             [[ "$uzak_boyut" == "$yerel_boyut" ]] || { echo "::error::$ad boyutu uyuşmuyor ($uzak_boyut != $yerel_boyut)"; exit 1; }
