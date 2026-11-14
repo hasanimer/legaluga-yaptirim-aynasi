@@ -32,11 +32,14 @@ kullandığı `POST /api/PublicationPreview/SdnList` ve `/ConsolidatedList` yan�
 - Resmî özet uç noktası yanıt vermez ya da biçimi değişirse çalıştırma kırmızıya düşer, hiçbir
   şey yayımlanmaz. En yeni 30 sürüm saklanır, daha eskileri etiketleriyle birlikte silinir.
 
-Her sürümde üç dosya bulunur:
+Her sürümde şu dosyalar bulunur:
 
 - `sdn.xml` ve `consolidated.xml`: OFAC'ın yayımladığı dosyaların **değiştirilmemiş, bayt bayt
   kopyası**. Sıkıştırma, yeniden biçimlendirme veya ayıklama yapılmaz.
 - `manifest.json`: dosyaların özeti, boyutu, OFAC yayın tarihi ve kayıt sayısı.
+- `degisiklikler.json` ve `ofac-delta-<yayın>.xml` (isteğe bağlı): OFAC'ın resmî değişiklik
+  akışındaki en yeni 30 yayının delta dosyaları ve önceki sürüme göre uid farkı; bkz.
+  [değişiklik verisi](#değişiklik-verisi).
 
 Neden: Legaluga'nın Cloudflare Workers üzerinde çalışan yaptırım taraması OFAC indirme adresine
 doğrudan ulaşamıyor. OFAC adresleri imzalı bir AWS GovCloud S3 adresine yönlendiriyor ve bu
@@ -100,6 +103,72 @@ aynıdır.
 > [neden bu sıklık](#neden-bu-sıklık)) yenilenir; bu alan da eskiyorsa ayna çalışmıyordur.
 > Listenin tarihi `publish_date`'tir.
 
+## Değişiklik verisi
+
+OFAC'ın SDN XML'inde kayıt başına tarih yoktur; hangi kaydın eklendiği, çıkarıldığı ya da
+değiştiği iki kaynaktan çıkarılır ve her yeni sürüme konur:
+
+1. **OFAC'ın resmî değişiklik akışı.** `GET /changes/history/{yıl}` yayınları
+   (`publicationID`, `datePublished`) listeler; `GET /changes/{id}` imzalı bir GovCloud S3
+   adresine yönlendirir ve `DeltaFile/1.0` XML'i verir. Her `entity` öğesinin `id`'si SDN
+   XML'indeki `sdnEntry/uid` ile aynıdır; `action="add"` eklenen, `action="remove"` çıkarılan,
+   özniteliği olmayan entity alt öğeleri değişen kayıttır. Ayna en yeni 30 yayının delta
+   dosyasını değiştirmeden `ofac-delta-<id>.xml` adıyla Release'e koyar.
+2. **Önceki sürüme göre uid farkı.** Önceki sürümün `sdn.xml`/`consolidated.xml` dosyaları (önceki
+   manifestin özetine karşı denetlenerek) yeni dosyalarla karşılaştırılır. Her `sdnEntry` ad alanı
+   ve girintiden bağımsız biçimde normalize edilip SHA-256'sı alınır; uid'i yalnız yenide olan
+   eklenen, yalnız eskide olan çıkarılan, özeti farklı olan değişen sayılır. Bu fark OFAC'ın
+   deltasında kayıt başına görünmeyen içerik değişikliklerini de yakalar (ör. toplu eklenen alan
+   türleri), bu yüzden "değişen" sayısı deltalarınkinden büyük olabilir.
+
+`manifest.json` yalnız küçük bir işaretçi taşır (16 KiB sınırı yalnız işaretçi ve özet içindir):
+
+```json
+"degisiklikler": {
+  "ad": "degisiklikler.json",
+  "sha256": "1d5b87f4…",
+  "boyut": 21807,
+  "son_yayin_id": 1107,
+  "yayin_sayisi": 30
+}
+```
+
+`degisiklikler.json` (girintisiz JSON, en çok 8 MiB):
+
+| Alan | Anlamı |
+|---|---|
+| `surum` | Özet biçiminin sürümü (`1`). |
+| `etiket`, `olusturuldu_at` | Manifestteki değerlerle aynı. |
+| `ofac_yayinlari` | `null` (akış alınamadı) ya da `{gecmis_url, yayinlar}`. `yayinlar` yeniden eskiye: `yayin_id`, `yayin_zamani` (geçmişteki `datePublished`, ABD Doğu saati, saat dilimi yok), `delta_tarihi` (deltadaki `datePublished`), `yayin_turu`, `ad`, `kaynak_url`, `sha256`, `boyut`, `eklenen`, `cikarilan`, `degisen` (sıralı uid listeleri). |
+| `liste_farki` | Liste anahtarı başına `onceki_etiket`, `onceki_sha256`, `onceki_publish_date`, `sha256`, `publish_date`, `eklenen`, `cikarilan`, `degisen`. Önceki sürüm ya da dosyası yoksa o liste bulunmaz. |
+| `uyarilar` | Bu sürümde değişiklik verisinin eksik kalan kısımları. |
+
+Güven zinciri: manifest `degisiklikler.json`'un SHA-256'sını, o da her delta dosyasının
+SHA-256'sını taşır. Okuyucu adresleri manifestteki değerlerden değil, sabit depo + etiket +
+`^ofac-delta-[1-9][0-9]*\.xml$` ya da `degisiklikler.json` adından kurmalıdır.
+
+Davranış:
+
+- Değişiklik verisi **isteğe bağlıdır**: geçmiş ya da bir delta alınamazsa, biçimi bozuksa ya da
+  izin listesi dışındaki bir sunucuya yönlendirirse uyarı verilir ve sürüm OFAC dosyalarıyla yine
+  yayımlanır (`ofac_yayinlari: null`, `son_yayin_id: null`). Ayna bunun yüzünden durmaz.
+- Delta dosyası için ek denetimler: kök `{https://www.treasury.gov/ofac/DeltaFile/1.0}sanctionsData`,
+  tek `publicationInfo` ve `entities`, `datePublished` günü geçmişteki yayının günüyle aynı,
+  entity id'leri pozitif tamsayı ve tekil, `action` yok/`add`/`remove`, iki yayın aynı dosyayı
+  vermiyor, her dosya en çok 40 MiB, toplam en çok 200 MiB.
+- OFAC dosyaları aynıyken de geçmişte yeni bir yayın görünürse (ya da önceki manifestte
+  değişiklik verisi yoksa) yeni sürüm açılır. Yayın verisi alınamayan bir çalıştırma, dosyalar
+  aynıysa yayın verisi olan önceki sürümün yerine geçmez; nabız yayımlanır.
+- Nabızda geçmiş (yılda bir küçük JSON) okunur, dosya ve delta indirilmez.
+
+**Kapatma ve geri dönüş.** Depo değişkeni `DEGISIKLIK_VERISI` = `kapali` (Settings → Secrets and
+variables → Actions → Variables) özelliği kapatır: geçmiş okunmaz, nabız önceki manifesti
+olduğu gibi taşır, bir sonraki değişiklik sürümü eski biçimde (`degisiklikler` alanı ve ek
+dosyalar olmadan) yayımlanır. Bu betiğin özellikten önceki sürümü `degisiklikler` alanlı
+manifesti reddeder (çıkış 2); kodu geri almak gerekirse önce değişkeni `kapali` yapın, eski
+biçimli bir sürümün `latest` olmasını bekleyin, sonra geri alın. Legaluga'nın okuyucusu bilinmeyen
+alanları yok sayar; `surum` 1 kalır.
+
 ## Doğrulama
 
 Her çalıştırmada betik şunları denetler; biri tutmazsa sürüm yayımlanmaz ve iş kırmızıya düşer:
@@ -156,7 +225,8 @@ aynı olmalıdır.
 - Aynı anda tek çalıştırma olur (`concurrency`).
 - Doğrulama veya indirme hatasında iş başarısız olur ve GitHub depo sahibine e-posta gönderir.
   O çalıştırmada hiçbir şey yayımlanmaz; son iyi sürüm `latest` olarak kalır.
-- Yayımlandıktan sonra sürüm denetlenir (taslak değil, 3 dosya, boyut ve SHA-256 aynı, `latest`).
+- Yayımlandıktan sonra sürüm denetlenir (taslak değil, `--yayin-dosyalari` listesindeki bütün
+  dosyalar, boyut ve SHA-256 aynı, `latest`).
   Denetim geçmezse bu çalıştırmanın oluşturduğu sürüm silinir; önceki sürüm `latest` olarak
   kalır ve sonraki çalıştırma yeniden yayımlar.
 - **Gerileme denetimini elle atlamak:** OFAC aynı `Publish_Date` ile kayıtların %10'undan
@@ -239,11 +309,15 @@ python3 scripts/ayna.py --cikti cikti --notlar notlar.md
 python3 scripts/ayna.py --cikti cikti --onceki onceki/manifest.json
 python3 scripts/ayna.py --cikti cikti --onceki onceki/manifest.json --gerileme-denetimini-atla
 python3 scripts/ayna.py --degisti-mi --yeni cikti/manifest.json --onceki onceki/manifest.json
+python3 scripts/ayna.py --cikti cikti --onceki onceki/manifest.json --onceki-dizin onceki
+python3 scripts/ayna.py --cikti cikti --degisiklikler-kapali
+python3 scripts/ayna.py --yayin-dosyalari cikti
 ```
 
 Çıkış kodları: `0` başarılı, `2` doğrulama hatası, `3` indirme hatası, `64` kullanım hatası.
 `--degisti-mi` kipi indirme yapmaz; iki manifestteki `sha256` değerlerini karşılaştırıp
-`degisti` veya `ayni` yazar.
+`degisti` veya `ayni` yazar. `--yayin-dosyalari` de indirme yapmaz; dizindeki her dosyayı
+manifestteki özetine karşı denetleyip Release'e konacak adları satır satır yazar.
 
 ## İşletim notları
 
@@ -290,6 +364,12 @@ A byte-for-byte mirror of the U.S. Treasury OFAC **SDN** (`sdn.xml`) and **Non-S
   their size and SHA-256 equal OFAC's official values**.
 - Release assets: the unmodified official files plus `manifest.json` with the SHA-256 (and the
   official SHA-256 it was verified against), size, `Publish_Date` and `Record_Count` of each file.
+- Change data (optional; disable with repository variable `DEGISIKLIK_VERISI=kapali`): the
+  delta XML of OFAC's 30 most recent publications from the official change feed
+  (`/changes/history/{year}`, `/changes/{id}`, `DeltaFile/1.0`) as `ofac-delta-<id>.xml`, and
+  `degisiklikler.json` with per-publication added/removed/changed entity ids plus a uid diff
+  against the previous release (normalized `sdnEntry` SHA-256). `manifest.json` only carries a
+  small pointer (`degisiklikler`). Failure to fetch change data never blocks the mirror.
 - Legaluga reads `releases/latest/download/manifest.json`, then fetches each file by the tag in
   the manifest (never via `latest`) and checks size and SHA-256.
 - Schedule rationale: the 6-hourly floor keeps the scheduled gap between checks at 6 hours and

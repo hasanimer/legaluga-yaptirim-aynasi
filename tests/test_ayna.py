@@ -34,8 +34,17 @@ def xml_uret(
     kok: str = "sdnList",
     ad_alani: str | None = None,
     yayin_bilgisi: bool = True,
+    uidler=None,
+    degisen: dict | None = None,
 ) -> bytes:
-    """OFAC SDN biçiminde küçük, sentetik bir XML üretir."""
+    """OFAC SDN biçiminde küçük, sentetik bir XML üretir.
+
+    uidler verilirse kayıtlar bu uid'lerle (kayit yerine) üretilir; degisen {uid: soyad}
+    o kayıtların lastName değerini değiştirir.
+    """
+    uidler = list(range(1, kayit + 1)) if uidler is None else list(uidler)
+    kayit = len(uidler)
+    degisen = degisen or {}
     xmlns = (
         f' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="{ad_alani}"'
         if ad_alani
@@ -50,9 +59,10 @@ def xml_uret(
             parcalar.append(f"    <Publish_Date>{publish_date}</Publish_Date>\n")
         parcalar.append(f"    <Record_Count>{record_count}</Record_Count>\n")
         parcalar.append("  </publshInformation>\n")
-    for i in range(1, kayit + 1):
+    for i in uidler:
         parcalar.append(
-            f"  <sdnEntry><uid>{i}</uid><lastName>DENEME {i}</lastName><sdnType>Entity</sdnType>"
+            f"  <sdnEntry><uid>{i}</uid><lastName>{degisen.get(i, f'DENEME {i}')}</lastName>"
+            "<sdnType>Entity</sdnType>"
             "<programList><program>SDGT</program></programList>"
             f"<akaList><aka><uid>{1000 + i}</uid><type>a.k.a.</type><category>strong</category>"
             f"<lastName>TAKMA {i}</lastName></aka></akaList></sdnEntry>\n"
@@ -668,7 +678,13 @@ class UctanUcaTestler(SunuculuTest):
         self.assertEqual(kod, 3, hata)
         self.assertEqual(len(self.uykular), ayna.YENIDEN_DENEME)
 
+    # Bu sınıfın testleri değişiklik verisi kapalıyken (özellikten önceki davranış) çalışır;
+    # DegisiklikUctanUcaTestleri açık hâlini sınar.
+    degisiklikler_acik = False
+
     def calistir(self, argv, an=datetime(2026, 10, 4, 15, 30, 12, tzinfo=timezone.utc)):
+        if not self.degisiklikler_acik:
+            argv = list(argv) + ["--degisiklikler-kapali"]
         cikti, hata = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(cikti), contextlib.redirect_stderr(hata):
             kod = ayna.main(
@@ -677,6 +693,8 @@ class UctanUcaTestler(SunuculuTest):
                 uyku=self.uyku,
                 saat=lambda: an,
                 adres_denetimi=self.yerel_adres_mi,
+                gecmis_koku=self.taban + "/changes/history/",
+                delta_koku=self.taban + "/changes/",
             )
         return kod, cikti.getvalue(), hata.getvalue()
 
@@ -821,6 +839,608 @@ class UctanUcaTestler(SunuculuTest):
             kod, cikti, _ = self.calistir(["--cikti", os.path.join(self.dizin, "cikti")])
         self.assertEqual(kod, 2)
         self.assertTrue(re.match(r"^::error title=Yaptırım aynası doğrulama hatası::", cikti))
+
+
+# --------------------------------------------------------------------------- değişiklik verisi
+
+DELTA_NS = "https://www.treasury.gov/ofac/DeltaFile/1.0"
+
+
+def delta_uret(tarih="2026-10-02T00:00:00-04:00", varliklar=(), ad_alani=DELTA_NS, tur="Standard Action"):
+    """DeltaFile/1.0 biçiminde küçük bir delta XML'i. varliklar: [(id, action ya da None)]."""
+    parcalar = [
+        '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n',
+        f'<sanctionsData xmlns="{ad_alani}">\n',
+        f"  <publicationInfo><datePublished>{tarih}</datePublished>"
+        f"<publicationType>{tur}</publicationType></publicationInfo>\n",
+        "  <referenceValues /><featureTypes />\n  <entities>\n",
+    ]
+    for kimlik, eylem in varliklar:
+        ozn = f' action="{eylem}"' if eylem else ""
+        parcalar.append(
+            f'    <entity id="{kimlik}"{ozn}><names><name id="9{kimlik}" action="add">'
+            "<isPrimary>true</isPrimary></name></names>"
+            '<relationships><relationship id="7"><relatedEntity entityId="5">X</relatedEntity>'
+            "</relationship></relationships></entity>\n"
+        )
+    parcalar.append("  </entities>\n</sanctionsData>\n")
+    return "".join(parcalar).encode("utf-8")
+
+
+def isaretci(son=1107, sayi=3, sha="c" * 64, boyut=100) -> dict:
+    return {
+        "ad": "degisiklikler.json",
+        "sha256": sha,
+        "boyut": boyut,
+        "son_yayin_id": son,
+        "yayin_sayisi": sayi,
+    }
+
+
+class DegisiklikManifestTestleri(unittest.TestCase):
+    def test_eski_ve_yeni_manifest_gecerli(self):
+        eski = manifest()
+        ayna.manifest_dogrula(eski, ["ofac:sdn", "ofac:non_sdn"])
+        yeni = dict(manifest(), degisiklikler=isaretci())
+        ayna.manifest_dogrula(yeni, ["ofac:sdn", "ofac:non_sdn"])
+        ayna.manifest_dogrula(dict(manifest(), degisiklikler=isaretci(son=None, sayi=0)))
+        self.assertEqual(yeni["surum"], 1)
+        self.assertLess(len(ayna.manifest_baytlari(yeni)), 16 * 1024)
+
+    def test_bozuk_isaretci_reddedilir(self):
+        bozuklar = [
+            "degisiklikler.json",
+            dict(isaretci(), fazla=1),
+            {k: v for k, v in isaretci().items() if k != "boyut"},
+            isaretci(sha="XYZ"),
+            isaretci(boyut=0),
+            isaretci(boyut=ayna.DEGISIKLIK_OZETI_AZAMI_BAYT + 1),
+            isaretci(son=None, sayi=3),
+            isaretci(son=1107, sayi=0),
+            isaretci(son=True),
+            isaretci(son=-1),
+            dict(isaretci(), ad="sdn.xml"),
+            dict(isaretci(), ad="../degisiklikler.json"),
+        ]
+        for bozuk in bozuklar:
+            with self.assertRaises(ayna.DogrulamaHatasi, msg=repr(bozuk)):
+                ayna.manifest_dogrula(dict(manifest(), degisiklikler=bozuk))
+        # Bilinmeyen başka üst düzey alanlar hâlâ reddedilir.
+        with self.assertRaises(ayna.DogrulamaHatasi):
+            ayna.manifest_dogrula(dict(manifest(), degisiklikler=isaretci(), fazla=1))
+
+    def test_degisti_mi_yayin_verisi(self):
+        eski = manifest()
+        self.assertFalse(ayna.degisti_mi(manifest(), eski))
+        # Yayın verisi ilk kez eklenir.
+        self.assertTrue(ayna.degisti_mi(dict(manifest(), degisiklikler=isaretci()), eski))
+        onceki = dict(manifest(), degisiklikler=isaretci(son=1105))
+        self.assertTrue(ayna.degisti_mi(dict(manifest(), degisiklikler=isaretci(son=1107)), onceki))
+        self.assertFalse(ayna.degisti_mi(dict(manifest(), degisiklikler=isaretci(son=1105)), onceki))
+        # Yayın verisi alınamayan çalıştırma, aynı dosyalarla öncekinin yerine geçmez.
+        self.assertFalse(
+            ayna.degisti_mi(dict(manifest(), degisiklikler=isaretci(son=None, sayi=0)), onceki)
+        )
+        self.assertFalse(ayna.degisti_mi(manifest(), onceki))
+
+
+class DeltaDogrulamaTestleri(GeciciDizinli):
+    def test_gecerli_delta(self):
+        yol = self.yaz(
+            "d.xml",
+            delta_uret(varliklar=[(30, "add"), (10, "remove"), (20, None), (5, "add")]),
+        )
+        self.assertEqual(
+            ayna.delta_dogrula(yol, "2026-10-02T11:32:59.89"),
+            {
+                "delta_tarihi": "2026-10-02T00:00:00-04:00",
+                "yayin_turu": "Standard Action",
+                "eklenen": [5, 30],
+                "cikarilan": [10],
+                "degisen": [20],
+            },
+        )
+        bos = self.yaz("bos.xml", delta_uret())
+        self.assertEqual(ayna.delta_dogrula(bos, "2026-10-02T09:00:00")["eklenen"], [])
+
+    def test_bozuk_deltalar(self):
+        durumlar = [
+            (delta_uret(ad_alani="https://www.treasury.gov/ofac/DeltaFile/2.0"), "kök"),
+            (xml_uret(), "kök"),
+            (delta_uret(varliklar=[(1, "update")]), "action"),
+            (delta_uret(varliklar=[(1, "add"), (1, None)]), "tekrar"),
+            (delta_uret(varliklar=[("01", "add")]), "id"),
+            (delta_uret(varliklar=[("x", "add")]), "id"),
+            (delta_uret(tarih="2026-10-03T00:00:00-04:00"), "gününe"),
+            (delta_uret(tarih="dün"), "datePublished"),
+            (delta_uret(tur=""), "publicationType"),
+            (delta_uret()[:-30], "iyi biçimli"),
+            (delta_uret().replace(b"<entities>", b"<entities></entities><entities>"), "entities"),
+        ]
+        for veri, beklenen in durumlar:
+            yol = self.yaz("d.xml", veri)
+            with self.assertRaisesRegex(ayna.DogrulamaHatasi, beklenen, msg=veri[:200]):
+                ayna.delta_dogrula(yol, "2026-10-02T11:00:00")
+
+
+class ListeFarkiTestleri(GeciciDizinli):
+    def test_eklenen_cikarilan_degisen(self):
+        eski = self.yaz("eski.xml", xml_uret(uidler=[1, 2, 3, 4]))
+        yeni = self.yaz("yeni.xml", xml_uret(uidler=[2, 3, 4, 5, 6], degisen={3: "YENI AD"}))
+        self.assertEqual(
+            ayna.liste_farki_hesapla(ayna.kayit_ozetleri(eski), ayna.kayit_ozetleri(yeni)),
+            {"eklenen": [5, 6], "cikarilan": [1], "degisen": [3]},
+        )
+
+    def test_girinti_ve_ad_alani_degisiklik_sayilmaz(self):
+        duz = xml_uret(kayit=3)
+        ns = xml_uret(kayit=3, ad_alani=OFAC_NS)
+        girintili = duz.replace(b"<lastName>", b"\n      <lastName>")
+        ozet = ayna.kayit_ozetleri(self.yaz("a.xml", duz))
+        self.assertEqual(ozet, ayna.kayit_ozetleri(self.yaz("b.xml", ns)))
+        self.assertEqual(ozet, ayna.kayit_ozetleri(self.yaz("c.xml", girintili)))
+        self.assertEqual(sorted(ozet), [1, 2, 3])  # akaList içindeki uid'ler kayıt sayılmaz
+
+    def test_bozuk_uid(self):
+        for veri in (
+            xml_uret(uidler=[1, 1]),
+            xml_uret(kayit=1).replace(b"<uid>1</uid>", b"<uid>bir</uid>"),
+            xml_uret(kayit=1).replace(b"<uid>1</uid>", b""),
+        ):
+            with self.assertRaises(ayna.DogrulamaHatasi):
+                ayna.kayit_ozetleri(self.yaz("a.xml", veri))
+
+
+class DegisiklikOzetiTestleri(unittest.TestCase):
+    def ozet(self) -> dict:
+        return {
+            "surum": 1,
+            "etiket": "ayna-202610041530",
+            "olusturuldu_at": "2026-10-04T15:30:12Z",
+            "ofac_yayinlari": {
+                "gecmis_url": ayna.DEGISIKLIK_GECMIS_KOKU,
+                "yayinlar": [
+                    {
+                        "yayin_id": 1107,
+                        "yayin_zamani": "2026-10-02T11:32:59.899866",
+                        "delta_tarihi": "2026-10-02T00:00:00-04:00",
+                        "yayin_turu": "Standard Action",
+                        "ad": "ofac-delta-1107.xml",
+                        "kaynak_url": ayna.DEGISIKLIK_DELTA_KOKU + "1107",
+                        "sha256": "d" * 64,
+                        "boyut": 10,
+                        "eklenen": [1, 2],
+                        "cikarilan": [],
+                        "degisen": [3],
+                    }
+                ],
+            },
+            "liste_farki": {
+                "ofac:sdn": {
+                    "onceki_etiket": "ayna-202610031530",
+                    "onceki_sha256": "a" * 64,
+                    "onceki_publish_date": "10/01/2026",
+                    "sha256": "b" * 64,
+                    "publish_date": "10/02/2026",
+                    "eklenen": [1],
+                    "cikarilan": [],
+                    "degisen": [],
+                }
+            },
+            "uyarilar": [],
+        }
+
+    def test_gecerli(self):
+        ayna.degisiklik_ozeti_dogrula(self.ozet(), "ayna-202610041530")
+        ozet = dict(self.ozet(), ofac_yayinlari=None)
+        ayna.degisiklik_ozeti_dogrula(ozet)
+
+    def test_bozuk(self):
+        def yayin(m):
+            return m["ofac_yayinlari"]["yayinlar"][0]
+
+        def fark(m):
+            return m["liste_farki"]["ofac:sdn"]
+
+        bozucular = [
+            lambda m: m.update(surum=2),
+            lambda m: m.update(fazla=1),
+            lambda m: m.update(uyarilar=[1]),
+            lambda m: m["ofac_yayinlari"].update(gecmis_url="https://ornek/"),
+            lambda m: m["ofac_yayinlari"].update(yayinlar=[]),
+            lambda m: yayin(m).update(ad="../sdn.xml"),
+            lambda m: yayin(m).update(ad="ofac-delta-1.xml"),
+            lambda m: yayin(m).update(kaynak_url="https://ornek/1107"),
+            lambda m: yayin(m).update(eklenen=[2, 1]),
+            lambda m: yayin(m).update(eklenen=[0]),
+            lambda m: yayin(m).update(yayin_turu="<b>"),
+            lambda m: m["ofac_yayinlari"]["yayinlar"].append(dict(yayin(m))),
+            lambda m: fark(m).update(onceki_publish_date="2026-10-01"),
+            lambda m: fark(m).update(onceki_sha256="b" * 64),
+            lambda m: fark(m).pop("degisen"),
+        ]
+        for bozucu in bozucular:
+            m = copy.deepcopy(self.ozet())
+            bozucu(m)
+            with self.assertRaises(ayna.DogrulamaHatasi, msg=repr(m)):
+                ayna.degisiklik_ozeti_dogrula(m)
+        with self.assertRaises(ayna.DogrulamaHatasi):
+            ayna.degisiklik_ozeti_dogrula(self.ozet(), "ayna-202610041531")
+
+
+class DegisiklikUctanUcaTestleri(UctanUcaTestler):
+    """UctanUcaTestler'in bütün testleri değişiklik verisi açıkken de çalışır (miras); aşağıdaki
+    testler değişiklik verisine özgüdür."""
+
+    degisiklikler_acik = True
+
+    def setUp(self):
+        super().setUp()
+        self.gecmis = {
+            2026: [
+                {"publicationID": 1107, "datePublished": "2026-10-02T11:32:59.899866"},
+                {"publicationID": 1105, "datePublished": "2026-09-14T14:36:11.1"},
+            ],
+            2025: [{"publicationID": 1001, "datePublished": "2025-12-30T10:00:00"}],
+        }
+        self.deltalar = {
+            1107: delta_uret("2026-10-02T00:00:00-04:00", [(12, "add"), (3, None)]),
+            1105: delta_uret("2026-09-14T00:00:00-04:00", [(99, "remove")]),
+            1001: delta_uret("2025-12-30T00:00:00-05:00", [(7, None)]),
+        }
+        self.gecmis_bozuk = {}
+        for yil in (2025, 2026):
+            self.sunucu.yollar[f"/changes/history/{yil}"] = lambda yil=yil: self.gecmis_bozuk.get(
+                yil, (200, {}, json.dumps(self.gecmis[yil]).encode("utf-8"))
+            )
+        for kimlik in (1107, 1105, 1001):
+            self.sunucu.yollar[f"/changes/{kimlik}"] = (
+                302,
+                {"Location": f"/s3/DeltaArchive/{kimlik}_delta.xml?X-Amz-Signature=gizli"},
+                b"",
+            )
+            self.sunucu.yollar[f"/s3/DeltaArchive/{kimlik}_delta.xml?X-Amz-Signature=gizli"] = (
+                lambda kimlik=kimlik: (200, {}, self.deltalar[kimlik])
+            )
+
+    # Miras alınan iki test çıktı dizinini tam olarak sayar; değişiklik verisiyle dosya listesi
+    # genişler. Burada aynı senaryolar yeni dosyalarla sınanır.
+    def test_ilk_calistirma_ve_degismeyen_ikinci_calistirma(self):
+        cikti_dizini = os.path.join(self.dizin, "cikti")
+        notlar = os.path.join(self.dizin, "notlar.md")
+        kod, cikti, hata = self.calistir(["--cikti", cikti_dizini, "--notlar", notlar])
+        self.assertEqual(kod, 0, hata)
+        self.assertIn("degisiklikler son_yayin_id=1107 yayin_sayisi=3", cikti)
+        self.assertEqual(
+            sorted(os.listdir(cikti_dizini)),
+            [
+                "consolidated.xml",
+                "degisiklikler.json",
+                "manifest.json",
+                "ofac-delta-1001.xml",
+                "ofac-delta-1105.xml",
+                "ofac-delta-1107.xml",
+                "sdn.xml",
+            ],
+        )
+        m = ayna.manifest_oku(os.path.join(cikti_dizini, "manifest.json"))
+        self.assertEqual(m["surum"], 1)
+        self.assertEqual(m["degisiklikler"]["son_yayin_id"], 1107)
+        self.assertEqual(m["degisiklikler"]["yayin_sayisi"], 3)
+        ozet = self.ozet_oku(cikti_dizini)
+        self.assertEqual(ozet["etiket"], m["etiket"])
+        yayinlar = ozet["ofac_yayinlari"]["yayinlar"]
+        self.assertEqual([y["yayin_id"] for y in yayinlar], [1107, 1105, 1001])
+        self.assertEqual(
+            yayinlar[0],
+            {
+                "yayin_id": 1107,
+                "yayin_zamani": "2026-10-02T11:32:59.899866",
+                "delta_tarihi": "2026-10-02T00:00:00-04:00",
+                "yayin_turu": "Standard Action",
+                "ad": "ofac-delta-1107.xml",
+                "kaynak_url": "https://sanctionslistservice.ofac.treas.gov/changes/1107",
+                "sha256": hashlib.sha256(self.deltalar[1107]).hexdigest(),
+                "boyut": len(self.deltalar[1107]),
+                "eklenen": [12],
+                "cikarilan": [],
+                "degisen": [3],
+            },
+        )
+        self.assertEqual(yayinlar[1]["cikarilan"], [99])
+        with open(os.path.join(cikti_dizini, "ofac-delta-1105.xml"), "rb") as dosya:
+            self.assertEqual(dosya.read(), self.deltalar[1105])
+        self.assertEqual(ozet["liste_farki"], {})
+        self.assertEqual(len(ozet["uyarilar"]), 2)  # iki liste için "önceki sürüm yok"
+        self.assertNotIn("X-Amz-Signature", json.dumps(ozet))
+        with open(notlar, encoding="utf-8") as dosya:
+            self.assertIn("| 1107 | 2026-10-02T11:32 | Standard Action | 1 | 0 | 1 |", dosya.read())
+        self.assertEqual(
+            self.yayin_dosyalari(cikti_dizini),
+            [
+                "sdn.xml",
+                "consolidated.xml",
+                "degisiklikler.json",
+                "ofac-delta-1107.xml",
+                "ofac-delta-1105.xml",
+                "ofac-delta-1001.xml",
+                "manifest.json",
+            ],
+        )
+
+        onceki = self.onceki_hazirla(cikti_dizini)
+        open(self.github_ciktisi, "w").close()
+        ikinci = os.path.join(self.dizin, "ikinci")
+        kod, cikti, hata = self.calistir(
+            ["--cikti", ikinci, "--onceki", onceki, "--onceki-dizin", os.path.dirname(onceki)]
+        )
+        self.assertEqual(kod, 0, hata)
+        self.assertIn("nabız", cikti)
+        self.assertEqual(os.listdir(ikinci), ["manifest.json"])
+        self.assertEqual(
+            ayna.manifest_oku(os.path.join(ikinci, "manifest.json"))["degisiklikler"],
+            m["degisiklikler"],
+        )
+
+    def test_nabiz_dosya_indirmeden_son_kontrol_at_yeniler(self):
+        onceki = self.ilk_surum()
+        self.sunucu.istekler.clear()
+        dizin, cikti, _ = self.ikinci(onceki)
+        self.assertIn("nabız", cikti)
+        self.assertEqual(os.listdir(dizin), ["manifest.json"])
+        # Nabızda yalnız resmî özetler ve değişiklik geçmişi okunur; dosya ya da delta indirilmez.
+        self.assertEqual(
+            sorted({yol for yol, _ in self.sunucu.istekler}),
+            [
+                "/api/PublicationPreview/ConsolidatedList",
+                "/api/PublicationPreview/SdnList",
+                "/changes/history/2025",  # 2026'da 30'dan az yayın var
+                "/changes/history/2026",
+            ],
+        )
+        m = ayna.manifest_oku(os.path.join(dizin, "manifest.json"))
+        self.assertEqual(m["son_kontrol_at"], "2026-10-04T18:17:03Z")
+        self.assertEqual(m["etiket"], "ayna-202610041530")
+
+    def test_gerileme_denetimi_elle_atlanir(self):
+        onceki = manifest(sdn=girdi(publish_date="10/03/2026", record_count=12))
+        onceki_yolu = self.yaz("onceki.json", ayna.manifest_baytlari(onceki))
+        cikti_dizini = os.path.join(self.dizin, "cikti")
+        kod, cikti, hata = self.calistir(
+            ["--cikti", cikti_dizini, "--onceki", onceki_yolu, "--gerileme-denetimini-atla"]
+        )
+        self.assertEqual(kod, 0, hata)
+        self.assertIn("gerileme denetimi elle atlandı", hata)
+        self.assertEqual(self.github_ciktilari()["degisti"], "true")
+        # Önceki dosyalar (onceki-dizin) yok: liste farkı uyarıyla atlanır.
+        ozet = self.ozet_oku(cikti_dizini)
+        self.assertEqual(ozet["liste_farki"], {})
+        self.assertEqual(len(ozet["uyarilar"]), 2)
+
+    def ozet_oku(self, dizin: str) -> dict:
+        with open(os.path.join(dizin, "degisiklikler.json"), encoding="utf-8") as dosya:
+            return json.load(dosya)
+
+    def yayin_dosyalari(self, dizin: str) -> list:
+        cikti, hata = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(cikti), contextlib.redirect_stderr(hata):
+            kod = ayna.main(["--yayin-dosyalari", dizin])
+        self.assertEqual(kod, 0, hata.getvalue())
+        return cikti.getvalue().split()
+
+    def onceki_hazirla(self, cikti_dizini: str) -> str:
+        """Çıktıyı iş akışının indirdiği gibi onceki/ dizinine taşır; manifest yolunu döner."""
+        onceki_dizini = os.path.join(self.dizin, "onceki")
+        if os.path.isdir(onceki_dizini):
+            for ad in os.listdir(onceki_dizini):
+                os.remove(os.path.join(onceki_dizini, ad))
+        os.makedirs(onceki_dizini, exist_ok=True)
+        for ad in ("manifest.json", "sdn.xml", "consolidated.xml"):
+            os.replace(os.path.join(cikti_dizini, ad), os.path.join(onceki_dizini, ad))
+        return os.path.join(onceki_dizini, "manifest.json")
+
+    def ilk_surum(self) -> str:
+        cikti_dizini = os.path.join(self.dizin, "ilk")
+        kod, _, hata = self.calistir(["--cikti", cikti_dizini])
+        self.assertEqual(kod, 0, hata)
+        open(self.github_ciktisi, "w").close()
+        return self.onceki_hazirla(cikti_dizini)
+
+    def ikinci(self, onceki: str, *ek):
+        cikti_dizini = os.path.join(self.dizin, "ikinci")
+        kod, cikti, hata = self.calistir(
+            ["--cikti", cikti_dizini, "--onceki", onceki, "--onceki-dizin", os.path.dirname(onceki), *ek],
+            an=datetime(2026, 10, 4, 18, 17, 3, tzinfo=timezone.utc),
+        )
+        self.assertEqual(kod, 0, hata)
+        return cikti_dizini, cikti, hata
+
+    def test_yalniz_yeni_ofac_yayini_yeni_surum_acar(self):
+        onceki = self.ilk_surum()
+        self.gecmis[2026].insert(0, {"publicationID": 1110, "datePublished": "2026-10-04T12:00:00"})
+        self.deltalar[1110] = delta_uret("2026-10-04T00:00:00-04:00", [(4, None)])
+        self.sunucu.yollar["/changes/1110"] = (200, {}, self.deltalar[1110])
+        dizin, cikti, _ = self.ikinci(onceki)
+        self.assertIn("ayna-202610041817 degisti", cikti)
+        self.assertEqual(self.github_ciktilari()["degisti"], "true")
+        ozet = self.ozet_oku(dizin)
+        self.assertEqual(ozet["ofac_yayinlari"]["yayinlar"][0]["yayin_id"], 1110)
+        for fark in ozet["liste_farki"].values():
+            self.assertEqual(fark["onceki_etiket"], "ayna-202610041530")
+            self.assertEqual((fark["eklenen"], fark["cikarilan"], fark["degisen"]), ([], [], []))
+        self.assertEqual(ozet["uyarilar"], [])
+
+    def test_liste_farki_onceki_surume_gore(self):
+        onceki = self.ilk_surum()
+        self.sdn = xml_uret(
+            uidler=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            ad_alani=OFAC_NS,
+            publish_date="10/03/2026",
+            degisen={5: "YENI AD"},
+        )
+        dizin, cikti, _ = self.ikinci(onceki)
+        self.assertIn("degisti", cikti)
+        fark = self.ozet_oku(dizin)["liste_farki"]
+        self.assertEqual(
+            fark["ofac:sdn"],
+            {
+                "onceki_etiket": "ayna-202610041530",
+                "onceki_sha256": ayna.manifest_oku(onceki)["dosyalar"]["ofac:sdn"]["sha256"],
+                "onceki_publish_date": "10/02/2026",
+                "sha256": hashlib.sha256(self.sdn).hexdigest(),
+                "publish_date": "10/03/2026",
+                "eklenen": [13, 14],
+                "cikarilan": [1],
+                "degisen": [5],
+            },
+        )
+        self.assertEqual(fark["ofac:non_sdn"]["eklenen"], [])
+
+    def test_onceki_dosya_ozetine_uymazsa_liste_farki_atlanir(self):
+        onceki = self.ilk_surum()
+        with open(os.path.join(os.path.dirname(onceki), "sdn.xml"), "ab") as dosya:
+            dosya.write(b"\n")
+        self.sdn = xml_uret(kayit=13, ad_alani=OFAC_NS, publish_date="10/03/2026")
+        dizin, _, hata = self.ikinci(onceki)
+        ozet = self.ozet_oku(dizin)
+        self.assertNotIn("ofac:sdn", ozet["liste_farki"])
+        self.assertIn("ofac:non_sdn", ozet["liste_farki"])
+        self.assertTrue(any("özetine uymuyor" in u for u in ozet["uyarilar"]))
+        self.assertIn("UYARI", hata)
+
+    def test_eski_bicimli_onceki_manifestten_gecis(self):
+        # Özellikten önceki biçimde (degisiklikler alanı yok) bir önceki sürüm.
+        self.degisiklikler_acik = False
+        onceki = self.ilk_surum()
+        self.assertNotIn("degisiklikler", ayna.manifest_oku(onceki))
+        self.degisiklikler_acik = True
+        dizin, cikti, _ = self.ikinci(onceki)
+        self.assertIn("degisti", cikti)
+        m = ayna.manifest_oku(os.path.join(dizin, "manifest.json"))
+        self.assertEqual(m["degisiklikler"]["son_yayin_id"], 1107)
+        self.assertEqual(set(self.ozet_oku(dizin)["liste_farki"]), {"ofac:sdn", "ofac:non_sdn"})
+
+    def test_kapali_iken_yeni_bicimli_onceki_ile_nabiz(self):
+        onceki = self.ilk_surum()
+        self.degisiklikler_acik = False
+        dizin, cikti, _ = self.ikinci(onceki)
+        self.assertIn("nabız", cikti)
+        self.assertIn("degisiklikler", ayna.manifest_oku(os.path.join(dizin, "manifest.json")))
+        # Dosyalar değişince kapalı çalıştırma eski biçimli manifest yazar.
+        self.sdn = xml_uret(kayit=13, ad_alani=OFAC_NS, publish_date="10/03/2026")
+        dizin, cikti, _ = self.ikinci(onceki)
+        self.assertIn("degisti", cikti)
+        self.assertEqual(
+            sorted(os.listdir(dizin)), ["consolidated.xml", "manifest.json", "sdn.xml"]
+        )
+        self.assertNotIn("degisiklikler", ayna.manifest_oku(os.path.join(dizin, "manifest.json")))
+
+    def test_gecmis_alinamazsa_ayna_yine_yayimlar(self):
+        self.gecmis_bozuk[2026] = (503, {}, b"")
+        cikti_dizini = os.path.join(self.dizin, "cikti")
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+            kod, cikti, hata = self.calistir(["--cikti", cikti_dizini])
+        self.assertEqual(kod, 0, hata)
+        self.assertIn("::warning title=Yaptırım aynası::OFAC değişiklik geçmişi alınamadı", cikti)
+        m = ayna.manifest_oku(os.path.join(cikti_dizini, "manifest.json"))
+        self.assertEqual(m["degisiklikler"]["son_yayin_id"], None)
+        ozet = self.ozet_oku(cikti_dizini)
+        self.assertIsNone(ozet["ofac_yayinlari"])
+        self.assertTrue(ozet["uyarilar"][0].startswith("OFAC değişiklik geçmişi alınamadı"))
+        self.assertEqual(self.yayin_dosyalari(cikti_dizini)[-2:], ["degisiklikler.json", "manifest.json"])
+
+    def test_bicimi_bozuk_gecmis_uyari(self):
+        for bozuk in (
+            b"<html/>",
+            b"{}",
+            json.dumps([{"publicationID": "1107", "datePublished": "2026-10-02T11:00:00"}]).encode(),
+            json.dumps([{"publicationID": 1107, "datePublished": "dün"}]).encode(),
+            json.dumps([{"publicationID": 1107, "datePublished": "2026-10-02T11:00:00"}] * 2).encode(),
+        ):
+            self.gecmis_bozuk[2026] = (200, {}, bozuk)
+            with self.assertRaises(ayna.DogrulamaHatasi, msg=bozuk):
+                ayna.yayin_gecmisi_al(
+                    datetime(2026, 10, 4, tzinfo=timezone.utc),
+                    gecmis_koku=self.taban + "/changes/history/",
+                    uyku=self.uyku,
+                    adres_denetimi=self.yerel_adres_mi,
+                )
+
+    def test_gecmis_yil_siniri_ve_sayi(self):
+        al = lambda sayi: ayna.yayin_gecmisi_al(  # noqa: E731
+            datetime(2026, 10, 4, tzinfo=timezone.utc),
+            gecmis_koku=self.taban + "/changes/history/",
+            sayi=sayi,
+            uyku=self.uyku,
+            adres_denetimi=self.yerel_adres_mi,
+        )
+        self.assertEqual([y["yayin_id"] for y in al(2)], [1107, 1105])
+        self.assertNotIn("/changes/history/2025", [yol for yol, _ in self.sunucu.istekler])
+        self.assertEqual([y["yayin_id"] for y in al(5)], [1107, 1105, 1001])
+
+    def test_izinsiz_delta_yonlendirmesi_uyari_ve_delta_yok(self):
+        port = self.sunucu.server_address[1]
+        self.sunucu.yollar["/changes/1105"] = (
+            302,
+            {"Location": f"http://localhost:{port}/s3/x?X-Amz-Signature=gizli"},
+            b"",
+        )
+        cikti_dizini = os.path.join(self.dizin, "cikti")
+        kod, _, hata = self.calistir(["--cikti", cikti_dizini])
+        self.assertEqual(kod, 0, hata)
+        self.assertIn("OFAC delta dosyaları alınamadı: yayın 1105", hata)
+        self.assertNotIn("X-Amz-Signature", hata)
+        self.assertFalse([ad for ad in os.listdir(cikti_dizini) if ad.startswith(("ofac-delta", "."))])
+        self.assertIsNone(self.ozet_oku(cikti_dizini)["ofac_yayinlari"])
+
+    def test_yanlis_gunun_deltasi_reddedilir(self):
+        self.deltalar[1105] = self.deltalar[1107]
+        cikti_dizini = os.path.join(self.dizin, "cikti")
+        kod, _, hata = self.calistir(["--cikti", cikti_dizini])
+        self.assertEqual(kod, 0, hata)
+        self.assertIn("gününe", hata)
+        self.assertIsNone(self.ozet_oku(cikti_dizini)["ofac_yayinlari"])
+
+    def test_delta_alinamazsa_onceki_surum_korunur_nabiz(self):
+        onceki = self.ilk_surum()
+        self.gecmis[2026].insert(0, {"publicationID": 1110, "datePublished": "2026-10-04T12:00:00"})
+        self.sunucu.yollar["/changes/1110"] = (404, {}, b"")
+        dizin, cikti, hata = self.ikinci(onceki)
+        self.assertIn("nabız", cikti)
+        self.assertIn("OFAC delta dosyaları alınamadı", hata)
+        self.assertEqual(os.listdir(dizin), ["manifest.json"])
+        self.assertEqual(
+            ayna.manifest_oku(os.path.join(dizin, "manifest.json"))["degisiklikler"]["son_yayin_id"],
+            1107,
+        )
+
+    def test_yayin_dosyalari_degistirilmis_dosyayi_yakalar(self):
+        cikti_dizini = os.path.join(self.dizin, "cikti")
+        kod, _, hata = self.calistir(["--cikti", cikti_dizini])
+        self.assertEqual(kod, 0, hata)
+        for ad in ("ofac-delta-1105.xml", "degisiklikler.json", "sdn.xml"):
+            yol = os.path.join(cikti_dizini, ad)
+            with open(yol, "rb") as dosya:
+                asil = dosya.read()
+            with open(yol, "ab") as dosya:
+                dosya.write(b" ")
+            hata = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(hata):
+                self.assertEqual(ayna.main(["--yayin-dosyalari", cikti_dizini]), 2, ad)
+            self.assertIn(ad, hata.getvalue())
+            with open(yol, "wb") as dosya:
+                dosya.write(asil)
+        self.assertEqual(len(self.yayin_dosyalari(cikti_dizini)), 7)
+
+    def test_delta_adresleri_resmi_izin_listesinde(self):
+        self.assertTrue(ayna.resmi_adres_mi(ayna.DEGISIKLIK_GECMIS_KOKU + "2026"))
+        self.assertTrue(ayna.resmi_adres_mi(ayna.DEGISIKLIK_DELTA_KOKU + "1107"))
+        self.assertTrue(
+            ayna.resmi_adres_mi(
+                "https://wc2h-sls-prod-public-published.s3.us-gov-west-1.amazonaws.com/"
+                "DeltaArchive/2026-11-13_delta.xml?X-Amz-Signature=x"
+            )
+        )
 
 
 if __name__ == "__main__":
