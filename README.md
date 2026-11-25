@@ -99,8 +99,9 @@ aynıdır.
 > **Tazelik ölçütü `son_kontrol_at`'tir.** `olusturuldu_at` ve `indirildi_at` bu **sürümün
 > oluşturulduğu** çalıştırmanın zamanıdır; OFAC günlerce yayın yapmayabileceği için sağlıklı bir
 > aynada da günlerce eski olabilir. Sürüm çoğunlukla liste değiştiğinde, bazen de dosyalar aynıyken
-> (yeni bir OFAC yayını ya da değişiklik verisinin ilk kez eklenmesi) açılır; listenin değişip
-> değişmediği `sha256` ve `publish_date` ile anlaşılır. `son_kontrol_at` ise her başarılı çalıştırmada (planlı olarak
+> (yeni bir OFAC yayını ya da değişiklik verisinin ilk kez eklenmesi) açılır. Listenin değişip
+> değişmediği `publish_date` ve `degisiklikler.json` içindeki `liste_farki` ile anlaşılır;
+> `sha256` OFAC dosyayı yeniden ürettiğinde içerik aynıyken de değişir. `son_kontrol_at` ise her başarılı çalıştırmada (planlı olarak
 > en geç 6 saatte bir; GitHub'ın gecikmeleri yüzünden pratikte daha seyrek, bkz.
 > [neden bu sıklık](#neden-bu-sıklık)) yenilenir; bu alan da eskiyorsa ayna çalışmıyordur.
 > Listenin tarihi `publish_date`'tir.
@@ -124,9 +125,9 @@ değiştiği iki kaynaktan çıkarılır ve her yeni sürüme konur:
    `id`'lerin) sırasını değiştirir; sıra anlam taşımadığı için bu "değişen" sayılmaz. Bu fark
    OFAC'ın deltasında kayıt başına görünmeyen içerik değişikliklerini de yakalar (ör. toplu
    eklenen alan türleri), bu yüzden "değişen" sayısı deltalarınkinden büyük olabilir.
-   Kasım 2026'daki bu düzeltmeden önce yayımlanan sürümlerde (`ayna-202611232350` dahil) sıra
-   değişikliği de "değişen" sayılıyordu; o sürümlerin `liste_farki.*.degisen` listeleri yayın
-   başına binlerce yanlış kayıt içerir.
+   Bu düzeltmeden önceki dört sürümde (`ayna-202611182027` – `ayna-202611232350`) sıra
+   değişikliği de "değişen" sayılıyordu; o sürümlerde `liste_farki` içindeki `degisen` listeleri
+   `ofac:sdn` için yaklaşık 3000, `ofac:non_sdn` için birkaç yüz yanlış kayıt içerir.
 
 `manifest.json` yalnız küçük bir işaretçi taşır (16 KiB sınırı yalnız işaretçi ve özet içindir):
 
@@ -231,15 +232,18 @@ aynı olmalıdır.
   çalıştırılabilir.
 - Aynı anda tek çalıştırma olur (`concurrency`).
 - Doğrulama veya indirme hatasında iş başarısız olur ve GitHub depo sahibine e-posta gönderir.
-  O çalıştırmada hiçbir şey yayımlanmaz; son iyi sürüm `latest` olarak kalır. GitHub ve OFAC'ın
-  geçici hataları (ağ, 5xx, JSON olmayan bakım sayfası, GitHub API okuma ve yükleme hataları)
-  kısa beklemelerle yeniden denenir; kırmızı çalıştırma bunların tükendiğini gösterir.
-- **Adımı ve günlüğü olmayan, birkaç saniyede biten kırmızı çalıştırma kod hatası değil, GitHub
-  hesabı sorunudur.** Nedeni çalıştırma sayfasındaki uyarıda (Annotations) yazar; 24 Ekim 2026'daki
-  iki başarısız çalıştırmada bu, hesabın faturalandırma nedeniyle kilitlenmesiydi ("account is
-  locked due to a billing issue"). Hesap kilitliyken GitHub zamanlanmış çalıştırmaları hiç
-  başlatmaz ve e-posta da göndermez: ayna 24 Ekim – 10 Kasım 2026 arasında 17 gün sessizce
-  çalışmadı. Depodaki hiçbir şey bunu haber veremez. Sorun hesap ayarlarından giderildikten sonra
+  O çalıştırmada hiçbir şey yayımlanmaz; son iyi sürüm `latest` olarak kalır.
+- Geçici hatalarda kısa beklemelerle yeniden denenenler: OFAC istekleri (ağ, 5xx, JSON olmayan
+  bakım sayfası), önceki sürümün ve manifestinin okunması, nabız yüklemesi ve `canli-tut`
+  çağrısı. Yeni sürümün yayımlanması ve budama tek denemedir; yayımlama hatasında sürüm geri
+  alınır ve sonraki çalıştırma yeniden yayımlar.
+- **Adımı ve günlüğü olmayan, birkaç saniyede biten kırmızı çalıştırma çoğunlukla kod hatası
+  değil, GitHub hesabı sorunudur.** Nedeni çalıştırma sayfasındaki uyarıda (Annotations) yazar;
+  24 Ekim 2026'daki iki başarısız çalıştırmada bu, hesabın faturalandırma nedeniyle
+  kilitlenmesiydi ("account is locked due to a billing issue"). Hesap kilitlenince ilk zamanlanmış
+  çalıştırmalar böyle kırmızıya düşer, ardından GitHub çalıştırma oluşturmayı bırakır ve o andan
+  sonra e-posta da gelmez: ayna 24 Ekim – 10 Kasım 2026 arasında 17 gün sessizce çalışmadı.
+  Depodaki hiçbir şey bunu haber veremez. Sorun hesap ayarlarından giderildikten sonra
   Actions → **Yaptırım aynası** → **Run workflow** ile bir kez elle çalıştırın. Aynanın canlı
   olduğunu denetlemek için `son_kontrol_at`'e bakın (48 saatten eskiyse ayna çalışmıyordur):
 
@@ -350,6 +354,7 @@ manifestteki özetine karşı denetleyip Release'e konacak adları satır satır
 - `latest` sürüm elle açılmış bir sürümse ya da içinde `manifest.json` yoksa iş akışı uyarı verir,
   ilk yayın gibi davranır ve yeni bir ayna sürümünü `latest` yapar.
 - Eski sürümler yalnız yeni sürüm yayımlanan çalıştırmalarda budanır; etiketleri ayrıca silinir.
+  Budama başarısız olursa artan sürümler bir sonraki yeni sürümde silinir.
 - **Depoda değişmez sürümleri (immutable releases) açmayın.** Nabız, yayımlanmış son sürümdeki
   `manifest.json`'u değiştirir; değişmez sürümlerde yayımlanmış dosya değiştirilemez, her nabız
   kırmızıya düşer ve `son_kontrol_at` yenilenmez.
@@ -395,8 +400,8 @@ A byte-for-byte mirror of the U.S. Treasury OFAC **SDN** (`sdn.xml`) and **Non-S
   (`/changes/history/{year}`, `/changes/{id}`, `DeltaFile/1.0`) as `ofac-delta-<id>.xml`, and
   `degisiklikler.json` with per-publication added/removed/changed entity ids plus a uid diff
   against the previous release (normalized `sdnEntry` SHA-256, insensitive to sibling order;
-  releases published before the November 2026 fix, `ayna-202611232350` included, counted
-  order-only changes as changed). `manifest.json` only carries a
+  the four releases `ayna-202611182027` to `ayna-202611232350` counted order-only changes as
+  changed). `manifest.json` only carries a
   small pointer (`degisiklikler`). Failure to fetch change data never blocks the mirror.
 - Legaluga reads `releases/latest/download/manifest.json`, then fetches each file by the tag in
   the manifest (never via `latest`) and checks size and SHA-256.
@@ -409,11 +414,13 @@ A byte-for-byte mirror of the U.S. Treasury OFAC **SDN** (`sdn.xml`) and **Non-S
 - Freshness: `son_kontrol_at` is refreshed on every successful run (scheduled at most 6 hours
   apart, in practice less often); Legaluga stops using the mirror when it is older than 48 hours.
   `olusturuldu_at` / `indirildi_at` record the run that created the release (usually a list
-  change, sometimes a new OFAC publication with identical files); `sha256` / `publish_date` tell
-  whether a list changed.
-- A red run with no steps or logs is a GitHub account problem (see the run's annotations), not a
-  code failure; while the account is locked GitHub starts no scheduled runs and sends no email,
-  so check `son_kontrol_at` and run the workflow manually once the account is fixed.
+  change, sometimes a new OFAC publication with identical files); `publish_date` and
+  `liste_farki` tell whether a list changed (`sha256` also changes when OFAC merely regenerates
+  a file).
+- A red run with no steps or logs is usually a GitHub account problem (see the run's
+  annotations), not a code failure; once the account is locked the first scheduled runs fail
+  this way and GitHub then stops creating runs and sending email, so check `son_kontrol_at` and
+  run the workflow manually once the account is fixed.
 - **This is not an official OFAC source** and is not affiliated with OFAC or the U.S. Department
   of the Treasury. It may be delayed or unavailable. Verify with OFAC for any compliance decision.
 - Data: U.S. Government work, public domain in the U.S. under 17 U.S.C. § 105. Scripts and docs:

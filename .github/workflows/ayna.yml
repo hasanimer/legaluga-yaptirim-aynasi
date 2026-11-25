@@ -276,8 +276,9 @@ jobs:
           fi
 
       - name: Eski sürümleri buda
-        # Sürüm sayısı yalnız yeni sürüm yayımlanınca artar; nabız çalıştırmalarında budanacak
-        # bir şey yoktur ve buradaki bir GitHub okuma hatası çalıştırmayı boşuna kırmızıya düşürürdü.
+        # Sürüm sayısı yalnız yeni sürüm yayımlanınca artar; nabız çalıştırmalarında buradaki bir
+        # GitHub okuma hatası çalıştırmayı boşuna kırmızıya düşürürdü. Budama başarısız olursa
+        # artan sürümler bir sonraki yeni sürümde silinir.
         if: steps.ayna.outputs.degisti == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
