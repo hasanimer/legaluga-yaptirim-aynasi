@@ -58,7 +58,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p onceki
-          if gh api "repos/$GH_REPO/releases/latest" > son.json 2> onceki-hata.txt; then
+          # GitHub'ın geçici bir hatası çalıştırmayı kırmızıya düşürmesin: okuma üç kez denenir.
+          # 404 kesin yanıttır (henüz sürüm yok) ve yeniden denenmez. Yönlendirmeler döngünün
+          # içindedir: gh api hata gövdesini stdout'a yazar, son.json'da kalmamalı.
+          durum=hata
+          for deneme in 1 2 3; do
+            if gh api "repos/$GH_REPO/releases/latest" > son.json 2> onceki-hata.txt; then
+              durum=var
+              break
+            fi
+            if grep -q "HTTP 404" onceki-hata.txt; then
+              durum=yok
+              break
+            fi
+            cat onceki-hata.txt >&2
+            (( deneme == 3 )) || sleep $(( deneme * 10 ))
+          done
+          if [[ "$durum" == var ]]; then
             etiket=$(jq -r .tag_name son.json)
             if [[ ! "$etiket" =~ ^ayna-[0-9]{12}$ ]]; then
               echo "::warning::latest sürüm ($etiket) bir ayna sürümü değil; ilk yayın gibi davranılıyor, yeni ayna sürümü latest yapılacak."
@@ -66,7 +82,18 @@ jobs:
               echo "::warning::latest sürümde ($etiket) manifest.json yok; ilk yayın gibi davranılıyor, yeni ayna sürümü latest yapılacak."
             else
               echo "Önceki sürüm: $etiket"
-              gh release download "$etiket" --pattern manifest.json --dir onceki
+              # Manifest indirilemezse "ilk yayın" yoluna düşülmez (gerileme denetimi atlanır,
+              # aynı veriyle yeni sürüm açılırdı): denemeler tükenince adım başarısız olur.
+              for deneme in 1 2 3; do
+                if gh release download "$etiket" --pattern manifest.json --dir onceki --clobber; then
+                  break
+                fi
+                if (( deneme == 3 )); then
+                  echo "::error::Önceki manifest indirilemedi ($etiket)"
+                  exit 1
+                fi
+                sleep $(( deneme * 10 ))
+              done
               # Liste farkı (değişiklik verisi) için önceki XML'ler; betik onları önceki
               # manifestin özetine karşı denetler. İndirilemezse yalnız liste farkı atlanır.
               if ! gh release download "$etiket" --pattern sdn.xml --pattern consolidated.xml \
@@ -75,10 +102,9 @@ jobs:
                 echo "::warning::Önceki sürümün XML dosyaları indirilemedi; liste farkı üretilmeyecek."
               fi
             fi
-          elif grep -q "HTTP 404" onceki-hata.txt; then
+          elif [[ "$durum" == yok ]]; then
             echo "Önceki sürüm yok; ilk yayın yapılacak."
           else
-            cat onceki-hata.txt >&2
             echo "::error::Önceki sürüm okunamadı"
             exit 1
           fi
@@ -115,7 +141,22 @@ jobs:
           [[ "$ETIKET" =~ ^ayna-[0-9]{12}$ ]] || { echo "::error::Geçersiz etiket: $ETIKET"; exit 1; }
           # --clobber eskisini silip yenisini yükler; arada birkaç saniye manifest.json bulunmaz ve
           # Legaluga o an resmî kaynağa düşer. Veri dosyalarına dokunulmaz.
-          gh release upload "$ETIKET" cikti/manifest.json --clobber
+          # Yükleme yeniden denenir: silme başarılı olup yükleme başarısız kalırsa sürümde
+          # manifest.json bulunmaz ve sonraki çalıştırma aynı veriyle yeni sürüm açar. Yeniden
+          # deneme zararsızdır (--clobber eksik dosyayı yalnızca yükler).
+          yuklendi=false
+          for deneme in 1 2 3 4; do
+            if gh release upload "$ETIKET" cikti/manifest.json --clobber; then
+              yuklendi=true
+              break
+            fi
+            echo "::warning::Nabız yüklemesi başarısız (deneme $deneme/4)"
+            (( deneme == 4 )) || sleep $(( deneme * 15 ))
+          done
+          if [[ "$yuklendi" != true ]]; then
+            echo "::error::Nabız manifesti yüklenemedi ($ETIKET); manifest.json sürümde eksik olabilir"
+            exit 1
+          fi
           yerel=$(sha256sum cikti/manifest.json | cut -d' ' -f1)
           for deneme in 1 2 3 4 5 6; do
             uzak=$(gh api "repos/$GH_REPO/releases/tags/$ETIKET" \
@@ -235,9 +276,12 @@ jobs:
           fi
 
       - name: Eski sürümleri buda
+        # Sürüm sayısı yalnız yeni sürüm yayımlanınca artar; nabız çalıştırmalarında budanacak
+        # bir şey yoktur ve buradaki bir GitHub okuma hatası çalıştırmayı boşuna kırmızıya düşürürdü.
+        if: steps.ayna.outputs.degisti == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          YENI: ${{ steps.ayna.outputs.degisti == 'true' && steps.ayna.outputs.etiket || '' }}
+          YENI: ${{ steps.ayna.outputs.etiket }}
         run: |
           if ! gh api "repos/$GH_REPO/releases/latest" --jq .tag_name > son.txt 2> son-hata.txt; then
             if grep -q "HTTP 404" son-hata.txt; then
@@ -287,6 +331,7 @@ jobs:
           DEGISTI: ${{ steps.ayna.outputs.degisti }}
           ETIKET: ${{ steps.ayna.outputs.etiket }}
           DOGRULAMA: ${{ steps.dogrula.outcome }}
+          NABIZ: ${{ steps.nabiz.outcome }}
         run: |
           {
             echo "## Yaptırım aynası"
@@ -296,10 +341,16 @@ jobs:
                 if [[ "$DOGRULAMA" == "success" ]]; then
                   echo "Yeni sürüm: \`$ETIKET\`"
                 else
-                  echo "Yeni sürüm \`$ETIKET\` yayımlanamadı ya da doğrulanamadı; geri alma adımına bakın."
+                  echo "Yeni sürüm \`$ETIKET\` yayımlanamadı ya da doğrulanamadı; yayımlama, doğrulama ve geri alma adımlarına bakın."
                 fi
                 ;;
-              false) echo "Değişiklik yok (OFAC resmî özetleri aynı); son sürümün manifest.json'u nabızla yenilendi: \`$ETIKET\`" ;;
+              false)
+                if [[ "$NABIZ" == "success" ]]; then
+                  echo "Değişiklik yok (OFAC resmî özetleri aynı); son sürümün manifest.json'u nabızla yenilendi: \`$ETIKET\`"
+                else
+                  echo "Değişiklik yok, ancak nabız yayımlanamadı (\`$ETIKET\`); manifest.json sürümde eksik olabilir, \"Nabzı yayımla\" adımına bakın."
+                fi
+                ;;
               *) echo "Çalıştırma tamamlanmadı; adım günlüklerine bakın." ;;
             esac
             echo
@@ -322,5 +373,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           is_akisi=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
-          gh api -X PUT "repos/$GH_REPO/actions/workflows/$is_akisi/enable"
-          echo "İş akışı etkin tutuldu: $is_akisi"
+          # Tek bir geçici API hatası bütün çalıştırmayı kırmızıya düşürmesin; kalıcı hata
+          # (ör. izin değişikliği) yine başarısız olur, çünkü sonucu zamanlamanın sessizce kapanmasıdır.
+          for deneme in 1 2 3; do
+            if gh api -X PUT "repos/$GH_REPO/actions/workflows/$is_akisi/enable"; then
+              echo "İş akışı etkin tutuldu: $is_akisi"
+              exit 0
+            fi
+            (( deneme == 3 )) || sleep $(( deneme * 20 ))
+          done
+          echo "::error::İş akışı etkin tutulamadı: $is_akisi"
+          exit 1

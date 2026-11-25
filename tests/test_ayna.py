@@ -420,6 +420,9 @@ class _Isleyici(BaseHTTPRequestHandler):
         yanit = sunucu.yollar.get(self.path)
         if callable(yanit):
             yanit = yanit()
+        if yanit == "KOPAR":  # yanıt göndermeden bağlantıyı kapat
+            self.close_connection = True
+            return
         if yanit is None:
             yanit = (404, {}, b"yok")
         durum, basliklar, govde = yanit
@@ -498,6 +501,29 @@ class IndirmeTestleri(SunuculuTest):
                 self.indir("/x", os.path.join(self.dizin, "x"))
         self.assertEqual(len(self.sunucu.istekler), 4)  # ilk deneme + 3 yeniden deneme
         self.assertFalse(os.path.exists(os.path.join(self.dizin, "x")))
+
+    def test_ag_hatasi_429_ve_eksik_govde_yeniden_denenir(self):
+        govde = xml_uret(kayit=3)
+        yanitlar = [
+            "KOPAR",
+            (429, {}, b""),
+            (200, {"Content-Length": str(len(govde))}, govde[:50]),
+            (200, {}, govde),
+        ]
+        self.sunucu.yollar["/x"] = lambda: yanitlar.pop(0)
+        hedef = os.path.join(self.dizin, "x")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                self.indir("/x", hedef), (hashlib.sha256(govde).hexdigest(), len(govde))
+            )
+        self.assertEqual(self.uykular, [5, 15, 45])
+
+    def test_bos_govde_yeniden_denenir(self):
+        self.sunucu.yollar["/x"] = (200, {}, b"")
+        with self.assertRaisesRegex(ayna.IndirmeHatasi, "boş gövde"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.indir("/x", os.path.join(self.dizin, "x"))
+        self.assertEqual(len(self.sunucu.istekler), 4)
 
     def test_404_yeniden_denenmez(self):
         with self.assertRaisesRegex(ayna.IndirmeHatasi, "404"):
@@ -668,9 +694,41 @@ class UctanUcaTestler(SunuculuTest):
             (200, {}, json.dumps([{"fileName": "SDN.XML", "size": 5}]).encode("utf-8")),
         ):
             self.resmi_bozuk["SDN.XML"] = bozuk
+            self.uykular.clear()
             kod, _, hata = self.calistir(["--cikti", os.path.join(self.dizin, "c")])
             self.assertEqual(kod, 2, hata)
             self.assertIn("resmî özet yanıtı beklenen biçimde değil", hata)
+            # Yalnız JSON olmayan gövde (bakım sayfası olabilir) yeniden denenir; biçimi yanlış
+            # geçerli JSON hemen hatadır.
+            self.assertEqual(
+                len(self.uykular), ayna.YENIDEN_DENEME if bozuk[2].startswith(b"<") else 0, bozuk
+            )
+
+    def test_resmi_ozet_bir_kez_json_degilse_yeniden_denenir(self):
+        asil = self.sunucu.yollar["/api/PublicationPreview/SdnList"]
+        yanitlar = [(200, {}, b"<html>bakim</html>")]
+        self.sunucu.yollar["/api/PublicationPreview/SdnList"] = lambda: (
+            yanitlar.pop(0) if yanitlar else asil()
+        )
+        kod, _, hata = self.calistir(["--cikti", os.path.join(self.dizin, "c")])
+        self.assertEqual(kod, 0, hata)
+        self.assertEqual(self.uykular, [5])
+
+    def test_resmi_ozet_ag_hatasi_ve_429_yeniden_denenir(self):
+        asil = self.sunucu.yollar["/api/PublicationPreview/SdnList"]
+        yanitlar = ["KOPAR", (429, {}, b"")]
+        self.sunucu.yollar["/api/PublicationPreview/SdnList"] = lambda: (
+            yanitlar.pop(0) if yanitlar else asil()
+        )
+        kod, _, hata = self.calistir(["--cikti", os.path.join(self.dizin, "c")])
+        self.assertEqual(kod, 0, hata)
+        self.assertEqual(self.uykular[:2], [5, 15])
+
+    def test_resmi_ozet_baglanti_koparsa_3(self):
+        self.resmi_bozuk["SDN.XML"] = "KOPAR"
+        kod, _, hata = self.calistir(["--cikti", os.path.join(self.dizin, "c")])
+        self.assertEqual(kod, 3, hata)
+        self.assertEqual(len(self.uykular), ayna.YENIDEN_DENEME)
 
     def test_resmi_ozet_alinamazsa_3(self):
         self.resmi_bozuk["SDN.XML"] = (503, {}, b"")
@@ -981,6 +1039,32 @@ class ListeFarkiTestleri(GeciciDizinli):
         self.assertEqual(ozet, ayna.kayit_ozetleri(self.yaz("c.xml", girintili)))
         self.assertEqual(sorted(ozet), [1, 2, 3])  # akaList içindeki uid'ler kayıt sayılmaz
 
+    def test_kardes_sirasi_degisiklik_sayilmaz(self):
+        # OFAC dosyayı her yayında yeniden üretirken liste öğelerinin sırasını değiştirir.
+        def idli(*idler):
+            liste = "".join(
+                f"<id><uid>{no}</uid><idType>{tur}</idType><idNumber>{deger}</idNumber></id>"
+                for no, tur, deger in idler
+            )
+            return xml_uret(kayit=2).replace(
+                b"<uid>1</uid><lastName>", f"<uid>1</uid><idList>{liste}</idList><lastName>".encode()
+            )
+
+        a, b, c = (91, "Passport", "A1"), (92, "Tax ID No.", "B2"), (92, "Tax ID No.", "B3")
+        ozet = ayna.kayit_ozetleri(self.yaz("a.xml", idli(a, b)))
+        self.assertEqual(ozet, ayna.kayit_ozetleri(self.yaz("b.xml", idli(b, a))))
+        farkli = ayna.kayit_ozetleri(self.yaz("c.xml", idli(c, a)))  # içerik değişikliği
+        self.assertEqual(
+            ayna.liste_farki_hesapla(ozet, farkli), {"eklenen": [], "cikarilan": [], "degisen": [1]}
+        )
+        # Aynı kardeşin tekrarı kaybolmaz: iki kez geçen id bir kez geçenden farklıdır.
+        self.assertNotEqual(ozet, ayna.kayit_ozetleri(self.yaz("d.xml", idli(a, b, b))))
+        # Değer bir kardeşten ötekine taşınırsa kayıt değişmiştir.
+        tasinan = ayna.kayit_ozetleri(
+            self.yaz("e.xml", idli((91, "Passport", "B2"), (92, "Tax ID No.", "A1")))
+        )
+        self.assertNotEqual(ozet, tasinan)
+
     def test_bozuk_uid(self):
         for veri in (
             xml_uret(uidler=[1, 1]),
@@ -1278,8 +1362,14 @@ class DegisiklikUctanUcaTestleri(UctanUcaTestler):
             publish_date="10/03/2026",
             degisen={5: "YENI AD"},
         )
-        dizin, cikti, _ = self.ikinci(onceki)
+        notlar = os.path.join(self.dizin, "notlar.md")
+        dizin, cikti, _ = self.ikinci(onceki, "--notlar", notlar)
         self.assertIn("degisti", cikti)
+        with open(notlar, encoding="utf-8") as dosya:
+            self.assertIn(
+                "- `ofac:sdn` (`ayna-202610041530` → bu sürüm): 2 eklenen, 1 çıkarılan, 1 değişen",
+                dosya.read(),
+            )
         fark = self.ozet_oku(dizin)["liste_farki"]
         self.assertEqual(
             fark["ofac:sdn"],
@@ -1338,9 +1428,12 @@ class DegisiklikUctanUcaTestleri(UctanUcaTestler):
     def test_gecmis_alinamazsa_ayna_yine_yayimlar(self):
         self.gecmis_bozuk[2026] = (503, {}, b"")
         cikti_dizini = os.path.join(self.dizin, "cikti")
+        notlar = os.path.join(self.dizin, "notlar.md")
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
-            kod, cikti, hata = self.calistir(["--cikti", cikti_dizini])
+            kod, cikti, hata = self.calistir(["--cikti", cikti_dizini, "--notlar", notlar])
         self.assertEqual(kod, 0, hata)
+        with open(notlar, encoding="utf-8") as dosya:
+            self.assertIn("OFAC değişiklik akışı bu sürümde yok", dosya.read())
         self.assertIn("::warning title=Yaptırım aynası::OFAC değişiklik geçmişi alınamadı", cikti)
         m = ayna.manifest_oku(os.path.join(cikti_dizini, "manifest.json"))
         self.assertEqual(m["degisiklikler"]["son_yayin_id"], None)
@@ -1358,6 +1451,7 @@ class DegisiklikUctanUcaTestleri(UctanUcaTestler):
             json.dumps([{"publicationID": 1107, "datePublished": "2026-10-02T11:00:00"}] * 2).encode(),
         ):
             self.gecmis_bozuk[2026] = (200, {}, bozuk)
+            self.uykular.clear()
             with self.assertRaises(ayna.DogrulamaHatasi, msg=bozuk):
                 ayna.yayin_gecmisi_al(
                     datetime(2026, 10, 4, tzinfo=timezone.utc),
@@ -1365,6 +1459,10 @@ class DegisiklikUctanUcaTestleri(UctanUcaTestler):
                     uyku=self.uyku,
                     adres_denetimi=self.yerel_adres_mi,
                 )
+            # Yalnız JSON olmayan gövde yeniden denenir.
+            self.assertEqual(
+                len(self.uykular), ayna.YENIDEN_DENEME if bozuk.startswith(b"<") else 0, bozuk
+            )
 
     def test_gecmis_yil_siniri_ve_sayi(self):
         al = lambda sayi: ayna.yayin_gecmisi_al(  # noqa: E731

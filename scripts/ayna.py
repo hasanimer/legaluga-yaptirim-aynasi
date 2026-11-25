@@ -203,6 +203,11 @@ class _GeciciHata(Exception):
     """Yeniden denenebilecek indirme hatası."""
 
 
+class _JsonDegil(Exception):
+    """200 ile gelen gövde JSON değil (bakım ya da güvenlik duvarı sayfası olabilir): yeniden
+    denenir; denemeler tükenince doğrulama hatasıdır."""
+
+
 # --------------------------------------------------------------------------- yardımcılar
 
 
@@ -420,7 +425,7 @@ def _resmi_ozet_bir_kez(url: str, dosya_adi: str, zaman_asimi: float, adres_dene
     try:
         kayitlar = json.loads(veri.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as hata:
-        raise bicim("JSON değil") from hata
+        raise _JsonDegil(str(bicim("JSON değil"))) from hata
     if not isinstance(kayitlar, list):
         raise bicim("liste değil")
     eslesen = [
@@ -470,9 +475,14 @@ def resmi_ozet_al(
                 son_hata = f"HTTP {hata.code}"
                 continue
             raise IndirmeHatasi(f"resmî özet ({liste['resmi_liste']}): HTTP {hata.code}") from hata
+        except _JsonDegil as hata:
+            son_hata = hata
+            continue
         except (urllib.error.URLError, http.client.HTTPException, OSError) as hata:
             son_hata = f"{type(hata).__name__}: {hata}"
             continue
+    if isinstance(son_hata, _JsonDegil):
+        raise DogrulamaHatasi(str(son_hata))
     raise IndirmeHatasi(
         f"resmî özet ({liste['resmi_liste']}) {yeniden_deneme + 1} denemede alınamadı ({son_hata})"
     )
@@ -615,7 +625,8 @@ def onceki_ile_karsilastir(dosyalar: dict, onceki: dict) -> None:
 
 
 def _tekrarla(is_, aciklama: str, *, yeniden_deneme: int, beklemeler: tuple, uyku):
-    """is_()'i indir() ile aynı kuralla yeniden dener: ağ hatası, 408/425/429 ve 5xx."""
+    """is_()'i indir() ile aynı kuralla yeniden dener: ağ hatası, 408/425/429 ve 5xx; ayrıca
+    JSON olmayan 200 yanıtı (son denemede de öyleyse doğrulama hatası)."""
     son_hata: object = None
     for deneme in range(yeniden_deneme + 1):
         if deneme:
@@ -630,9 +641,14 @@ def _tekrarla(is_, aciklama: str, *, yeniden_deneme: int, beklemeler: tuple, uyk
                 son_hata = f"HTTP {hata.code}"
                 continue
             raise IndirmeHatasi(f"{aciklama}: HTTP {hata.code}") from hata
+        except _JsonDegil as hata:
+            son_hata = hata
+            continue
         except (urllib.error.URLError, http.client.HTTPException, OSError) as hata:
             son_hata = f"{type(hata).__name__}: {hata}"
             continue
+    if isinstance(son_hata, _JsonDegil):
+        raise DogrulamaHatasi(str(son_hata))
     raise IndirmeHatasi(f"{aciklama} {yeniden_deneme + 1} denemede alınamadı ({son_hata})")
 
 
@@ -659,7 +675,7 @@ def _json_getir(url: str, azami: int, zaman_asimi: float, adres_denetimi) -> obj
     try:
         return json.loads(veri.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as hata:
-        raise DogrulamaHatasi(f"{_adres_ozeti(url)} yanıtı JSON değil") from hata
+        raise _JsonDegil(f"{_adres_ozeti(url)} yanıtı JSON değil") from hata
 
 
 def yayin_gecmisi_al(
@@ -803,22 +819,29 @@ def delta_dogrula(yol: str, yayin_zamani: str) -> dict:
     }
 
 
-def _normal_bicim(oge) -> list:
-    """sdnEntry alt ağacının ad alanından ve girintiden bağımsız biçimi."""
-    return [
-        _yerel_ad(oge.tag),
-        sorted((_yerel_ad(anahtar), deger) for anahtar, deger in oge.attrib.items()),
-        (oge.text or "").strip(),
-        [_normal_bicim(cocuk) for cocuk in oge],
-    ]
+def _normal_bicim(oge) -> str:
+    """sdnEntry alt ağacının ad alanından, girintiden ve kardeş sırasından bağımsız JSON metni."""
+    bas = json.dumps(
+        [
+            _yerel_ad(oge.tag),
+            sorted((_yerel_ad(anahtar), deger) for anahtar, deger in oge.attrib.items()),
+            (oge.text or "").strip(),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    # Alt ağaçlar kendi metinlerine göre sıralanır; aynı kardeşler (tekrarlar) korunur.
+    cocuklar = sorted(_normal_bicim(cocuk) for cocuk in oge)
+    return f"{bas[:-1]},[{','.join(cocuklar)}]]"
 
 
 def kayit_ozetleri(yol: str) -> dict:
     """OFAC XML'indeki her sdnEntry için {uid: normalize kaydın sha256'sı} döner.
 
-    Normalize kayıt: öğe adları ad alanı öneki olmadan, öznitelikler sıralı, metinler kırpılmış,
-    alt öğeler belge sırasında. Girinti ve ad alanı değişikliği kaydı "değişmiş" yapmaz; alt
-    öğelerin sırası değişirse yapar.
+    Normalize kayıt: öğe adları ad alanı öneki olmadan, öznitelikler ve kardeş alt öğeler sıralı,
+    metinler kırpılmış. Girinti, ad alanı ve kardeş sırası değişikliği kaydı "değişmiş" yapmaz:
+    OFAC dosyayı her yayında yeniden üretirken liste öğelerinin (ör. idList altındaki id'lerin)
+    sırasını değiştirir; sıra anlam taşımaz.
     """
     derinlik = 0
     kok = None
@@ -845,10 +868,7 @@ def kayit_ozetleri(yol: str) -> dict:
                     uid = int(metin)
                     if uid in ozetler:
                         raise DogrulamaHatasi(f"sdnEntry uid {uid} tekrar ediyor")
-                    normal = json.dumps(
-                        _normal_bicim(oge), ensure_ascii=False, separators=(",", ":")
-                    )
-                    ozetler[uid] = hashlib.sha256(normal.encode("utf-8")).hexdigest()
+                    ozetler[uid] = hashlib.sha256(_normal_bicim(oge).encode("utf-8")).hexdigest()
                 kok.clear()
             derinlik -= 1
     except ET.ParseError as hata:
