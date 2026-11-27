@@ -336,6 +336,8 @@ manifestteki özetine karşı denetleyip Release'e konacak adları satır satır
 - **Betikler ve belgeler:** [MIT](LICENSE) © 2026 Hasan İmer Akın. MIT lisansı OFAC verisini
   kapsamaz.
 
+Bu deponun MIT lisanslı betiklerini veya belgelerini kullandığınız çalışmalarda [Legaluga Yaptırım Aynası](https://github.com/hasanimer/legaluga-yaptirim-aynasi) bağlantısını paylaşarak atıf yapmanızı rica ederiz.
+
 ---
 
 ## English summary
